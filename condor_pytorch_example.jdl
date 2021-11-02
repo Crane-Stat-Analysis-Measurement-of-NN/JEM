@@ -1,0 +1,25 @@
+# Invoke Singularity
+#
+universe   = vanilla
+executable = train_call.sh
+
+transfer_input_files = train_nosgld_noaug.py
+
+should_transfer_files = Yes
+when_to_transfer_output = ON_EXIT_OR_EVICT
+
+
+
+Log    = condor_logs/$(Cluster).log
+Output = condor_logs/$(Cluster)-$(Process).out
+Error  = condor_logs/$(Cluster)-$(Process).err
+
+# Enable Singularity feature
+## Notre Dame Images
++SingularityImage = "/cvmfs/singularity.opensciencegrid.org/notredamedulac/el7-pytorch-gpu:latest"
+
+request_gpus   = 1
+request_memory = 16 Gb
+request_cpus   = 1
+
+Queue 1
