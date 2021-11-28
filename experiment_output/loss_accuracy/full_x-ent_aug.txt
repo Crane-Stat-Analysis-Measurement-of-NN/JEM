@@ -1,0 +1,2890 @@
+Jupyter Notebook
+train_wrn_ebm_nb
+(unsaved changes)
+Current Kernel Logo
+Logout
+Control Panel
+Python 3 Trusted
+File
+Edit
+View
+Insert
+Cell
+Kernel
+Widgets
+Help
+Run
+In [1]:
+
+# imports
+import utils # from The Google Research Authors
+import torch as t, torch.nn as nn, torch.nn.functional as tnnF, torch.distributions as tdist
+from torch.utils.data import DataLoader, Dataset
+import torchvision as tv, torchvision.transforms as tr
+import os
+import sys
+import argparse
+#import ipdb
+import numpy as np
+import wideresnet # from The Google Research Authors
+import json
+In [2]:
+
+# Sampling
+from tqdm import tqdm
+t.backends.cudnn.benchmark = True
+t.backends.cudnn.enabled = True
+seed = 1
+​
+# images RGB 32x32
+im_sz = 32
+n_ch = 3
+In [3]:
+
+# get random subset of data
+class DataSubset(Dataset):
+    def __init__(self, base_dataset, inds=None, size=-1):
+        self.base_dataset = base_dataset
+        if inds is None:
+            inds = np.random.choice(list(range(len(base_dataset))), size, replace=False)
+        self.inds = inds
+​
+    def __getitem__(self, index):
+        base_ind = self.inds[index]
+        return self.base_dataset[base_ind]
+​
+    def __len__(self):
+        return len(self.inds)
+In [4]:
+
+# setup Wide_ResNet
+# Uses The Google Research Authors, file wideresnet.py
+class F(nn.Module):
+    def __init__(self, depth=28, width=2, norm=None, dropout_rate=0.0, n_classes=10):
+        super(F, self).__init__()
+        self.f = wideresnet.Wide_ResNet(depth, width, norm=norm, dropout_rate=dropout_rate)
+        self.energy_output = nn.Linear(self.f.last_dim, 1)
+        self.class_output = nn.Linear(self.f.last_dim, n_classes)
+​
+    def forward(self, x, y=None):
+        penult_z = self.f(x)
+        return self.energy_output(penult_z).squeeze()
+​
+    def classify(self, x):
+        penult_z = self.f(x)
+        return self.class_output(penult_z).squeeze()
+In [5]:
+
+# Energies if y=none
+# EBM energy calculated as logsumexp of logits
+class CCF(F):
+    def __init__(self, depth=28, width=2, norm=None, dropout_rate=0.0, n_classes=10):
+        super(CCF, self).__init__(depth, width, norm=norm, dropout_rate=dropout_rate, n_classes=n_classes)
+​
+    def forward(self, x, y=None):
+        logits = self.classify(x)
+        if y is None:
+            return logits.logsumexp(1)
+        else:
+            # gathers the logits along dim 1 with indeces y
+            return t.gather(logits, 1, y[:, None])
+In [6]:
+
+# various utilities
+def cycle(loader):
+    while True:
+        for data in loader:
+            yield data
+​
+def grad_norm(m):
+    total_norm = 0
+    for p in m.parameters():
+        param_grad = p.grad
+        if param_grad is not None:
+            param_norm = param_grad.data.norm(2) ** 2
+            total_norm += param_norm
+    total_norm = total_norm ** (1. / 2)
+    return total_norm.item()
+​
+def grad_vals(m):
+    ps = []
+    for p in m.parameters():
+        if p.grad is not None:
+            ps.append(p.grad.data.view(-1))
+    ps = t.cat(ps)
+    return ps.mean().item(), ps.std(), ps.abs().mean(), ps.abs().std(), ps.abs().min(), ps.abs().max()
+​
+def init_random(args, bs):
+    return t.FloatTensor(bs, n_ch, im_sz, im_sz).uniform_(-1, 1)
+In [7]:
+
+# Setup SGLD model and data/replay buffer
+# Images generated are added to a buffer and sampled with a probability (1-\rho) for efficiency
+def get_model_and_buffer(args, device, sample_q):
+    model_cls = F if args.uncond else CCF
+    f = model_cls(args.depth, args.width, args.norm, dropout_rate=args.dropout_rate, n_classes=args.n_classes)
+    if not args.uncond:
+        assert args.buffer_size % args.n_classes == 0, "Buffer size must be divisible by args.n_classes"
+    if args.load_path is None:
+        # make replay buffer
+        replay_buffer = init_random(args, args.buffer_size)
+    else:
+        print(f"loading model from {args.load_path}")
+        ckpt_dict = t.load(args.load_path)
+        f.load_state_dict(ckpt_dict["model_state_dict"])
+        replay_buffer = ckpt_dict["replay_buffer"]
+​
+    f = f.to(device)
+    return f, replay_buffer
+In [8]:
+
+# Load in chosen dataset from svhn, cifar10, cifar100
+def get_data(args):
+    if args.dataset == "svhn":
+        transform_train = tr.Compose(
+            [tr.Pad(4, padding_mode="reflect"),
+             tr.RandomCrop(im_sz),
+             tr.ToTensor(),
+             tr.Normalize((.5, .5, .5), (.5, .5, .5)),
+             lambda x: x + args.sigma * t.randn_like(x)]
+        )
+    else:
+        transform_train = tr.Compose(
+            [tr.Pad(4, padding_mode="reflect"),
+             tr.RandomCrop(im_sz),
+             tr.RandomHorizontalFlip(),
+             tr.ToTensor(),
+             tr.Normalize((.5, .5, .5), (.5, .5, .5)),
+             lambda x: x + args.sigma * t.randn_like(x)]
+        )
+    transform_test = tr.Compose(
+        [tr.ToTensor(),
+         tr.Normalize((.5, .5, .5), (.5, .5, .5)),
+         lambda x: x + args.sigma * t.randn_like(x)]
+    )
+    def dataset_fn(train, transform):
+        if args.dataset == "cifar10":
+            return tv.datasets.CIFAR10(root=args.data_root, transform=transform, download=True, train=train)
+        elif args.dataset == "cifar100":
+            return tv.datasets.CIFAR100(root=args.data_root, transform=transform, download=True, train=train)
+        else:
+            return tv.datasets.SVHN(root=args.data_root, transform=transform, download=True,
+                                    split="train" if train else "test")
+​
+    # get all training inds
+    full_train = dataset_fn(True, transform_train)
+    all_inds = list(range(len(full_train)))
+    # set seed
+    np.random.seed(1234)
+    # shuffle
+    np.random.shuffle(all_inds)
+    # seperate out validation set
+    if args.n_valid is not None:
+        valid_inds, train_inds = all_inds[:args.n_valid], all_inds[args.n_valid:]
+    else:
+        valid_inds, train_inds = [], all_inds
+    train_inds = np.array(train_inds)
+    train_labeled_inds = []
+    other_inds = []
+    train_labels = np.array([full_train[ind][1] for ind in train_inds])
+    if args.labels_per_class > 0:
+        for i in range(args.n_classes):
+            print(i)
+            train_labeled_inds.extend(train_inds[train_labels == i][:args.labels_per_class])
+            other_inds.extend(train_inds[train_labels == i][args.labels_per_class:])
+    else:
+        train_labeled_inds = train_inds
+​
+    dset_train = DataSubset(
+        dataset_fn(True, transform_train),
+        inds=train_inds)
+    dset_train_labeled = DataSubset(
+        dataset_fn(True, transform_train),
+        inds=train_labeled_inds)
+    dset_valid = DataSubset(
+        dataset_fn(True, transform_test),
+        inds=valid_inds)
+    dload_train = DataLoader(dset_train, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+    dload_train_labeled = DataLoader(dset_train_labeled, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+    dload_train_labeled = cycle(dload_train_labeled)
+    dset_test = dataset_fn(False, transform_test)
+    dload_valid = DataLoader(dset_valid, batch_size=100, shuffle=False, num_workers=4, drop_last=False)
+    dload_test = DataLoader(dset_test, batch_size=100, shuffle=False, num_workers=4, drop_last=False)
+    return dload_train, dload_train_labeled, dload_valid,dload_test
+In [9]:
+
+# Routine for SGLD generation of fake images
+def get_sample_q(args, device):
+    # setup initial data/buffers
+    def sample_p_0(replay_buffer, bs, y=None):
+        if len(replay_buffer) == 0:
+            return init_random(args, bs), []
+        buffer_size = len(replay_buffer) if y is None else len(replay_buffer) // args.n_classes
+        inds = t.randint(0, buffer_size, (bs,))
+        # if cond, convert inds to class conditional inds
+        if y is not None:
+            inds = y.cpu() * buffer_size + inds
+            assert not args.uncond, "Can't drawn conditional samples without giving me y"
+        buffer_samples = replay_buffer[inds]
+        random_samples = init_random(args, bs)
+        choose_random = (t.rand(bs) < args.reinit_freq).float()[:, None, None, None]
+        samples = choose_random * random_samples + (1 - choose_random) * buffer_samples
+        return samples.to(device), inds
+​
+    # actual SGLD
+    def sample_q(f, replay_buffer, y=None, n_steps=args.n_steps):
+        """this func takes in replay_buffer now so we have the option to sample from
+        scratch (i.e. replay_buffer==[]).  See test_wrn_ebm.py for example.
+        """
+        # here f is CCF to calculate energies
+        # evaluate model, must set train back on later (TODO:but I dont need to train energies?)
+        f.eval()
+        # get batch size
+        bs = args.batch_size if y is None else y.size(0)
+        # generate initial samples and buffer inds of those samples (if buffer is used)
+        init_sample, buffer_inds = sample_p_0(replay_buffer, bs=bs, y=y)
+        x_k = t.autograd.Variable(init_sample, requires_grad=True)
+        # sgld
+        for k in range(n_steps):
+            # calculate \parial E/\partial x_{k-1}
+            f_prime = t.autograd.grad(f(x_k, y=y).sum(), [x_k], retain_graph=True)[0]
+            # x_k = x_{k-1} + \alpha*\parial E/\partial x_{k-1} + \theta * N
+            x_k.data += args.sgld_lr * f_prime + args.sgld_std * t.randn_like(x_k)
+        
+        # set self.training = True
+        f.train()
+        
+        # Returns a new Tensor, detached from the current graph
+        final_samples = x_k.detach()
+        
+        # update replay buffer
+        if len(replay_buffer) > 0:
+            replay_buffer[buffer_inds] = final_samples.cpu()
+        return final_samples
+    return sample_q
+In [10]:
+
+# calculate loss and accuracy for periodic printout
+def eval_classification(f, dload, device):
+    corrects, losses = [], []
+    for x_p_d, y_p_d in dload:
+        x_p_d, y_p_d = x_p_d.to(device), y_p_d.to(device)
+        logits = f.classify(x_p_d)
+        loss = nn.CrossEntropyLoss(reduce=False)(logits, y_p_d).cpu().numpy()
+        losses.extend(loss)
+        correct = (logits.max(1)[1] == y_p_d).float().cpu().numpy()
+        corrects.extend(correct)
+    loss = np.mean(losses)
+    correct = np.mean(corrects)
+    return correct, loss
+In [11]:
+
+# save checkpoint data
+def checkpoint(f, buffer, tag, args, device):
+    f.cpu()
+    ckpt_dict = {
+        "model_state_dict": f.state_dict(),
+        "replay_buffer": buffer
+    }
+    t.save(ckpt_dict, os.path.join(args.save_dir, tag))
+    f.to(device)
+In [20]:
+
+# main function for training
+# Uses args from class below
+def main(args):
+    utils.makedirs(args.save_dir)
+    with open(f'{args.save_dir}/params.txt', 'w') as f:
+        json.dump(args.__dict__, f)
+    if args.print_to_log:
+        sys.stdout = open(f'{args.save_dir}/log.txt', 'w')
+​
+    t.manual_seed(seed)
+    if t.cuda.is_available():
+        t.cuda.manual_seed_all(seed)
+​
+    # datasets
+    dload_train, dload_train_labeled, dload_valid, dload_test = get_data(args)
+​
+    device = t.device('cuda' if t.cuda.is_available() else 'cpu')
+​
+    sample_q = get_sample_q(args, device)
+    f, replay_buffer = get_model_and_buffer(args, device, sample_q)
+​
+    sqrt = lambda x: int(t.sqrt(t.Tensor([x])))
+    plot = lambda p, x: tv.utils.save_image(t.clamp(x, -1, 1), p, normalize=True, nrow=sqrt(x.size(0)))
+​
+    # optimizer
+    params = f.class_output.parameters() if args.clf_only else f.parameters()
+    if args.optimizer == "adam":
+        optim = t.optim.Adam(params, lr=args.lr, betas=[.9, .999], weight_decay=args.weight_decay)
+    else:
+        optim = t.optim.SGD(params, lr=args.lr, momentum=.9, weight_decay=args.weight_decay)
+​
+    best_valid_acc = 0.0
+    cur_iter = 0
+    
+    # loop over epochs
+    for epoch in range(args.n_epochs):
+        # decaying learning rate?
+        if epoch in args.decay_epochs:
+            for param_group in optim.param_groups:
+                new_lr = param_group['lr'] * args.decay_rate
+                param_group['lr'] = new_lr
+            print("Decaying lr to {}".format(new_lr))
+            
+        # loop over data in batches
+        # x_p_d sample from dataset
+        for i, (x_p_d, _) in tqdm(enumerate(dload_train)):
+            # scale up lr to full over warmup time
+            if cur_iter <= args.warmup_iters:
+                lr = args.lr * cur_iter / float(args.warmup_iters)
+                for param_group in optim.param_groups:
+                    param_group['lr'] = lr
+​
+            #print("x_p_d_shape",x_p_d.shape)
+            x_p_d = x_p_d.to(device)
+            x_lab, y_lab = dload_train_labeled.__next__()
+            x_lab, y_lab = x_lab.to(device), y_lab.to(device)
+​
+            # initialize loss
+            L = 0.
+            
+            # this maximizes log p(x) using SGLD
+            if args.p_x_weight > 0:  # maximize log p(x)
+                if args.class_cond_p_x_sample:
+                    assert not args.uncond, "can only draw class-conditional samples if EBM is class-cond"
+                    y_q = t.randint(0, args.n_classes, (args.batch_size,)).to(device)
+                    x_q = sample_q(f, replay_buffer, y=y_q)
+                else:
+                    # get data generated by SGLD
+                    # In paper x_q_shape torch.Size([64, 3, 32, 32])
+                    # Batch rgb 32x32
+                    x_q = sample_q(f, replay_buffer)  # sample from log-sumexp
+                    #print("x_q_shape",x_q.shape)
+​
+                # calculate energy for training data
+                fp_all = f(x_p_d)
+                
+                # calculate energy for SGLD generated sample
+                fq_all = f(x_q)
+                
+                # get means
+                fp = fp_all.mean()
+                fq = fq_all.mean()
+​
+                # surrogate for the difference of expected value of \partial Energy/\partial x
+                # and \partial Energy/\partial x
+                # Need to maximize this, so preceded by minus
+                l_p_x = -(fp - fq)
+                if cur_iter % args.print_every == 0:
+                    print('P(x) | {}:{:>d} f(x_p_d)={:>14.9f} f(x_q)={:>14.9f} d={:>14.9f}'.format(epoch, i, fp, fq,
+                                                                                                   fp - fq))
+                # add to loss
+                L += args.p_x_weight * l_p_x
+​
+            # normal cross entropy loss function
+            if args.p_y_given_x_weight > 0:  # maximize log p(y | x)
+                logits = f.classify(x_lab)
+                l_p_y_given_x = nn.CrossEntropyLoss()(logits, y_lab)
+                if cur_iter % args.print_every == 0:
+                    acc = (logits.max(1)[1] == y_lab).float().mean()
+                    print('P(y|x) {}:{:>d} loss={:>14.9f}, acc={:>14.9f}'.format(epoch,
+                                                                                 cur_iter,
+                                                                                 l_p_y_given_x.item(),
+                                                                                 acc.item()))
+                # add to loss
+                L += args.p_y_given_x_weight * l_p_y_given_x
+​
+            #########################
+            # dont do this for paper
+            #########################
+            if args.p_x_y_weight > 0:  # maximize log p(x, y)
+                assert not args.uncond, "this objective can only be trained for class-conditional EBM DUUUUUUUUHHHH!!!"
+                x_q_lab = sample_q(f, replay_buffer, y=y_lab)
+                fp, fq = f(x_lab, y_lab).mean(), f(x_q_lab, y_lab).mean()
+                l_p_x_y = -(fp - fq)
+                if cur_iter % args.print_every == 0:
+                    print('P(x, y) | {}:{:>d} f(x_p_d)={:>14.9f} f(x_q)={:>14.9f} d={:>14.9f}'.format(epoch, i, fp, fq,
+                                                                                                      fp - fq))
+​
+                # add to loss
+                L += args.p_x_y_weight * l_p_x_y
+            #############################
+            # End dont do this for paper
+            #############################
+​
+            # break if the loss diverged...easier for poppa to run experiments this way
+            if L.abs().item() > 1e8:
+                print("BAD BOIIIIIIIIII")
+                1/0
+​
+            # Optimize network using our loss function L
+            optim.zero_grad()
+            L.backward()
+            optim.step()
+            cur_iter += 1
+​
+            # Plot outputs
+            if cur_iter % 100 == 0:
+                if args.plot_uncond:
+                    if args.class_cond_p_x_sample:
+                        assert not args.uncond, "can only draw class-conditional samples if EBM is class-cond"
+                        y_q = t.randint(0, args.n_classes, (args.batch_size,)).to(device)
+                        x_q = sample_q(f, replay_buffer, y=y_q)
+                    else:
+                        x_q = sample_q(f, replay_buffer)
+                    plot('{}/x_q_{}_{:>06d}.png'.format(args.save_dir, epoch, i), x_q)
+                if args.plot_cond:  # generate class-conditional samples
+                    y = t.arange(0, args.n_classes)[None].repeat(args.n_classes, 1).transpose(1, 0).contiguous().view(-1).to(device)
+                    x_q_y = sample_q(f, replay_buffer, y=y)
+                    plot('{}/x_q_y{}_{:>06d}.png'.format(args.save_dir, epoch, i), x_q_y)
+​
+        # do checkpointing
+        if epoch % args.ckpt_every == 0:
+            checkpoint(f, replay_buffer, f'ckpt_{epoch}.pt', args, device)
+​
+        # Print performance assesment 
+        if epoch % args.eval_every == 0 and (args.p_y_given_x_weight > 0 or args.p_x_y_weight > 0):
+            f.eval()
+            with t.no_grad():
+                # train set
+                correct, loss = eval_classification(f, dload_train, device)
+                print("Epoch {}: Train Loss {}, Train Acc {}".format(epoch, loss, correct))
+​
+                # test set
+                correct, loss = eval_classification(f, dload_test, device)
+                print("Epoch {}: Test Loss {}, Test Acc {}".format(epoch, loss, correct))
+​
+                # validation set
+                correct, loss = eval_classification(f, dload_valid, device)
+                print("Epoch {}: Valid Loss {}, Valid Acc {}".format(epoch, loss, correct))
+#                 if correct > best_valid_acc:
+#                     best_valid_acc = correct
+#                     print("Best Valid!: {}".format(correct))
+#                     checkpoint(f, replay_buffer, "best_valid_ckpt.pt", args, device)
+                
+            f.train()
+            
+        # do "last" checkpoint
+        checkpoint(f, replay_buffer, "last_ckpt.pt", args, device)
+In [21]:
+
+# Setup parameters
+# defaults for paper
+# --lr .0001 --dataset cifar10 --optimizer adam --p_x_weight 1.0 --p_y_given_x_weight 1.0 
+# --p_x_y_weight 0.0 --sigma .03 --width 10 --depth 28 --save_dir /YOUR/SAVE/DIR 
+# --plot_uncond --warmup_iters 1000
+#
+# Regression
+# {"dataset": "cifar10", "data_root": "../data", "lr": 0.0001, "decay_epochs": [160, 180], 
+# "decay_rate": 0.3, "clf_only": false, "labels_per_class": -1, "optimizer": "adam", 
+# "batch_size": 64, "n_epochs": 200, "warmup_iters": 1000, "p_x_weight": 1.0, 
+# "p_y_given_x_weight": 1.0, "p_x_y_weight": 0.0, "dropout_rate": 0.0, "sigma": 0.03, 
+# "weight_decay": 0.0, "norm": null, "n_steps": 20, "width": 10, "depth": 28, "uncond": false, 
+# "class_cond_p_x_sample": false, "buffer_size": 10000, "reinit_freq": 0.05, "sgld_lr": 1.0, 
+# "sgld_std": 0.01, "save_dir": "./savedir", "ckpt_every": 10, "eval_every": 1, 
+# "print_every": 100, "load_path": null, "print_to_log": false, "plot_cond": false, 
+#"plot_uncond": true, "n_valid": 5000, "n_classes": 10}
+class train_args():
+    def __init__(self, param_dict):
+        # set defaults
+        self.dataset = "cifar10" #, choices=["cifar10", "svhn", "cifar100"])
+        self.n_classes = 100 if self.dataset == "cifar100" else 10
+        self.data_root = "../data" 
+        # optimization
+        self.lr = 1e-4
+        self.decay_epochs = [160, 180] # help="decay learning rate by decay_rate at these epochs")
+        self.decay_rate = .3 # help="learning rate decay multiplier")
+        self.clf_only = False #action="store_true", help="If set, then only train the classifier")
+        self.labels_per_class = -1# help="number of labeled examples per class, if zero then use all labels")
+        self.optimizer = "adam" #choices=["adam", "sgd"], default="adam")
+        self.batch_size = 64
+        self.n_epochs = 200
+        self.warmup_iters = -1 # help="number of iters to linearly increase learning rate, if -1 then no warmmup")
+        # loss weighting
+        self.p_x_weight = 1.
+        self.p_y_given_x_weight = 1.
+        self.p_x_y_weight = 0.
+        # regularization
+        self.dropout_rate = 0.0
+        self.sigma = 3e-2 # help="stddev of gaussian noise to add to input, .03 works but .1 is more stable")
+        self.weight_decay = 0.0
+        # network
+        self.norm = None # choices=[None, "norm", "batch", "instance", "layer", "act"], help="norm to add to weights, none works fine")
+        # EBM specific
+        self.n_steps = 20 # help="number of steps of SGLD per iteration, 100 works for short-run, 20 works for PCD")
+        self.width = 10 # help="WRN width parameter")
+        self.depth = 28 # help="WRN depth parameter")
+        self.uncond = False # "store_true" # help="If set, then the EBM is unconditional")
+        self.class_cond_p_x_sample = False #, action="store_true", help="If set we sample from p(y)p(x|y), othewise sample from p(x)," "Sample quality higher if set, but classification accuracy better if not.")
+        self.buffer_size = 10000
+        self.reinit_freq = .05
+        self.sgld_lr = 1.0
+        self.sgld_std = 1e-2
+        # logging + evaluation
+        self.save_dir = './experiment'
+        self.ckpt_every = 10 # help="Epochs between checkpoint save")
+        self.eval_every = 1 # help="Epochs between evaluation")
+        self.print_every = 100 # help="Iterations between print")
+        self.load_path = None # path for checkpoint to load
+        self.print_to_log = False #", action="store_true", help="If true, directs std-out to log file")
+        self.plot_cond = False #", action="store_true", help="If set, save class-conditional samples")
+        self.plot_uncond = False #", action="store_true", help="If set, save unconditional samples")
+        self.n_valid = 5000
+        
+        # set from inline dict
+        for key in param_dict:
+            #print(key, '->', param_dict[key])
+            setattr(self, key, param_dict[key])
+In [*]:
+
+# setup change from defaults
+# For paper defaults
+# Added best_valid_ckpt load
+inline_parms = {"lr": .0001, "dataset": "cifar10", "optimizer": "adam", "save_dir": './full_with-aug_x-ent', \
+                "p_x_weight": 0.0, "p_y_given_x_weight": 1.0, "p_x_y_weight": 0.0, \
+                "sigma": .03, "width": 10, "depth": 28, "plot_uncond": False, "warmup_iters": -1}#, \
+                #"load_path": './savedir/best_valid_ckpt.pt'} # added loading from checkpoint
+​
+# instantiate
+args = train_args(inline_parms)
+​
+print("arg warmup_iters", args.warmup_iters, "lr", args.lr)
+​
+# run
+main(args)
+arg warmup_iters -1 lr 0.0001
+Files already downloaded and verified
+Files already downloaded and verified
+Files already downloaded and verified
+Files already downloaded and verified
+Files already downloaded and verified
+| Wide-Resnet 28x10
+2it [00:00,  4.69it/s]
+P(y|x) 0:0 loss=   2.309996367, acc=   0.109375000
+102it [00:13,  7.71it/s]
+P(y|x) 0:100 loss=   1.878972054, acc=   0.265625000
+202it [00:26,  7.71it/s]
+P(y|x) 0:200 loss=   1.789163709, acc=   0.328125000
+302it [00:39,  7.65it/s]
+P(y|x) 0:300 loss=   1.747246742, acc=   0.421875000
+402it [00:52,  7.65it/s]
+P(y|x) 0:400 loss=   1.495494127, acc=   0.437500000
+502it [01:05,  7.55it/s]
+P(y|x) 0:500 loss=   1.434982777, acc=   0.468750000
+602it [01:18,  7.52it/s]
+P(y|x) 0:600 loss=   1.453112006, acc=   0.453125000
+702it [01:31,  7.60it/s]
+P(y|x) 0:700 loss=   1.076548100, acc=   0.625000000
+703it [01:31,  7.64it/s]
+Epoch 0: Train Loss 1.3272451162338257, Train Acc 0.5130912065505981
+Epoch 0: Test Loss 1.278273582458496, Test Acc 0.534500002861023
+Epoch 0: Valid Loss 1.2859134674072266, Valid Acc 0.5238000154495239
+99it [00:13,  7.62it/s]
+P(y|x) 1:800 loss=   1.192790985, acc=   0.515625000
+199it [00:26,  7.60it/s]
+P(y|x) 1:900 loss=   1.372002125, acc=   0.484375000
+299it [00:39,  7.63it/s]
+P(y|x) 1:1000 loss=   1.125351787, acc=   0.625000000
+399it [00:52,  7.59it/s]
+P(y|x) 1:1100 loss=   0.865418553, acc=   0.640625000
+499it [01:05,  7.59it/s]
+P(y|x) 1:1200 loss=   0.972142875, acc=   0.656250000
+599it [01:19,  7.51it/s]
+P(y|x) 1:1300 loss=   0.951106071, acc=   0.625000000
+699it [01:32,  7.52it/s]
+P(y|x) 1:1400 loss=   0.908473849, acc=   0.687500000
+703it [01:32,  7.56it/s]
+Epoch 1: Train Loss 0.9864820837974548, Train Acc 0.6553609371185303
+Epoch 1: Test Loss 0.9505050778388977, Test Acc 0.6657000184059143
+Epoch 1: Valid Loss 0.9466978311538696, Valid Acc 0.6646000146865845
+96it [00:12,  7.59it/s]
+P(y|x) 2:1500 loss=   0.881117582, acc=   0.656250000
+196it [00:25,  7.59it/s]
+P(y|x) 2:1600 loss=   0.771080315, acc=   0.734375000
+296it [00:39,  7.59it/s]
+P(y|x) 2:1700 loss=   0.755360484, acc=   0.734375000
+396it [00:52,  7.58it/s]
+P(y|x) 2:1800 loss=   0.813129663, acc=   0.734375000
+496it [01:05,  7.55it/s]
+P(y|x) 2:1900 loss=   0.806537390, acc=   0.750000000
+596it [01:18,  7.56it/s]
+P(y|x) 2:2000 loss=   0.774307370, acc=   0.671875000
+696it [01:31,  7.50it/s]
+P(y|x) 2:2100 loss=   0.944259226, acc=   0.687500000
+703it [01:32,  7.57it/s]
+Epoch 2: Train Loss 0.7811174392700195, Train Acc 0.7275960445404053
+Epoch 2: Test Loss 0.7438673377037048, Test Acc 0.7372000217437744
+Epoch 2: Valid Loss 0.7440432906150818, Valid Acc 0.7337999939918518
+93it [00:12,  7.58it/s]
+P(y|x) 3:2200 loss=   0.902409554, acc=   0.671875000
+193it [00:25,  7.58it/s]
+P(y|x) 3:2300 loss=   0.618066847, acc=   0.781250000
+293it [00:38,  7.60it/s]
+P(y|x) 3:2400 loss=   0.749654949, acc=   0.718750000
+393it [00:51,  7.60it/s]
+P(y|x) 3:2500 loss=   0.591518939, acc=   0.812500000
+493it [01:05,  7.62it/s]
+P(y|x) 3:2600 loss=   0.848643422, acc=   0.625000000
+593it [01:18,  7.62it/s]
+P(y|x) 3:2700 loss=   0.661012590, acc=   0.734375000
+693it [01:31,  7.63it/s]
+P(y|x) 3:2800 loss=   0.411741793, acc=   0.859375000
+703it [01:32,  7.59it/s]
+Epoch 3: Train Loss 0.6729082465171814, Train Acc 0.7638691067695618
+Epoch 3: Test Loss 0.6891189217567444, Test Acc 0.7630000114440918
+Epoch 3: Valid Loss 0.681003987789154, Valid Acc 0.760200023651123
+90it [00:12,  7.61it/s]
+P(y|x) 4:2900 loss=   0.842622638, acc=   0.734375000
+190it [00:25,  7.60it/s]
+P(y|x) 4:3000 loss=   0.566298306, acc=   0.765625000
+290it [00:38,  7.60it/s]
+P(y|x) 4:3100 loss=   0.764993548, acc=   0.734375000
+390it [00:51,  7.64it/s]
+P(y|x) 4:3200 loss=   0.762436628, acc=   0.734375000
+490it [01:04,  7.62it/s]
+P(y|x) 4:3300 loss=   0.477705538, acc=   0.828125000
+590it [01:17,  7.62it/s]
+P(y|x) 4:3400 loss=   0.389990181, acc=   0.859375000
+690it [01:30,  7.64it/s]
+P(y|x) 4:3500 loss=   0.511904120, acc=   0.875000000
+703it [01:32,  7.59it/s]
+Epoch 4: Train Loss 0.5536027550697327, Train Acc 0.8074324131011963
+Epoch 4: Test Loss 0.5705402493476868, Test Acc 0.804099977016449
+Epoch 4: Valid Loss 0.5741729736328125, Valid Acc 0.8041999936103821
+87it [00:11,  7.56it/s]
+P(y|x) 5:3600 loss=   0.676341653, acc=   0.734375000
+187it [00:24,  7.59it/s]
+P(y|x) 5:3700 loss=   0.478802919, acc=   0.859375000
+287it [00:38,  7.59it/s]
+P(y|x) 5:3800 loss=   0.460433245, acc=   0.843750000
+387it [00:51,  7.58it/s]
+P(y|x) 5:3900 loss=   0.500160873, acc=   0.796875000
+487it [01:04,  7.64it/s]
+P(y|x) 5:4000 loss=   0.598659813, acc=   0.750000000
+587it [01:17,  7.60it/s]
+P(y|x) 5:4100 loss=   0.554313660, acc=   0.812500000
+687it [01:30,  7.59it/s]
+P(y|x) 5:4200 loss=   0.656132698, acc=   0.781250000
+703it [01:32,  7.57it/s]
+Epoch 5: Train Loss 0.509903609752655, Train Acc 0.8234797120094299
+Epoch 5: Test Loss 0.5602377653121948, Test Acc 0.8147000074386597
+Epoch 5: Valid Loss 0.5571900606155396, Valid Acc 0.8065999746322632
+84it [00:11,  7.73it/s]
+P(y|x) 6:4300 loss=   0.586632788, acc=   0.796875000
+184it [00:24,  7.65it/s]
+P(y|x) 6:4400 loss=   0.657263696, acc=   0.781250000
+284it [00:37,  7.68it/s]
+P(y|x) 6:4500 loss=   0.470643163, acc=   0.812500000
+384it [00:50,  7.70it/s]
+P(y|x) 6:4600 loss=   0.531089008, acc=   0.828125000
+484it [01:03,  7.71it/s]
+P(y|x) 6:4700 loss=   0.392286539, acc=   0.859375000
+584it [01:16,  7.69it/s]
+P(y|x) 6:4800 loss=   0.470022321, acc=   0.843750000
+684it [01:29,  7.68it/s]
+P(y|x) 6:4900 loss=   0.439101517, acc=   0.875000000
+703it [01:32,  7.62it/s]
+Epoch 6: Train Loss 0.4682499170303345, Train Acc 0.8368821144104004
+Epoch 6: Test Loss 0.5106284022331238, Test Acc 0.8258000016212463
+Epoch 6: Valid Loss 0.5234726667404175, Valid Acc 0.8202000260353088
+81it [00:10,  7.58it/s]
+P(y|x) 7:5000 loss=   0.587389350, acc=   0.796875000
+181it [00:23,  7.64it/s]
+P(y|x) 7:5100 loss=   0.295265645, acc=   0.875000000
+281it [00:37,  7.63it/s]
+P(y|x) 7:5200 loss=   0.746814311, acc=   0.812500000
+381it [00:50,  7.67it/s]
+P(y|x) 7:5300 loss=   0.335522920, acc=   0.875000000
+481it [01:03,  7.63it/s]
+P(y|x) 7:5400 loss=   0.545682490, acc=   0.812500000
+581it [01:16,  7.70it/s]
+P(y|x) 7:5500 loss=   0.330458701, acc=   0.890625000
+681it [01:29,  7.62it/s]
+P(y|x) 7:5600 loss=   0.342071861, acc=   0.890625000
+703it [01:32,  7.59it/s]
+Epoch 7: Train Loss 0.41281744837760925, Train Acc 0.8564856052398682
+Epoch 7: Test Loss 0.45143643021583557, Test Acc 0.8464999794960022
+Epoch 7: Valid Loss 0.4655369222164154, Valid Acc 0.8331999778747559
+78it [00:10,  7.63it/s]
+P(y|x) 8:5700 loss=   0.502540767, acc=   0.843750000
+178it [00:23,  7.54it/s]
+P(y|x) 8:5800 loss=   0.529999137, acc=   0.781250000
+278it [00:36,  7.64it/s]
+P(y|x) 8:5900 loss=   0.305981159, acc=   0.890625000
+378it [00:50,  7.58it/s]
+P(y|x) 8:6000 loss=   0.336870790, acc=   0.921875000
+478it [01:03,  7.58it/s]
+P(y|x) 8:6100 loss=   0.768615007, acc=   0.781250000
+578it [01:16,  7.64it/s]
+P(y|x) 8:6200 loss=   0.347244918, acc=   0.890625000
+678it [01:29,  7.62it/s]
+P(y|x) 8:6300 loss=   0.608341157, acc=   0.796875000
+703it [01:32,  7.57it/s]
+Epoch 8: Train Loss 0.37337639927864075, Train Acc 0.8701991438865662
+Epoch 8: Test Loss 0.44870176911354065, Test Acc 0.8519999980926514
+Epoch 8: Valid Loss 0.46732646226882935, Valid Acc 0.8420000076293945
+75it [00:10,  7.60it/s]
+P(y|x) 9:6400 loss=   0.291683197, acc=   0.906250000
+175it [00:23,  7.58it/s]
+P(y|x) 9:6500 loss=   0.356213152, acc=   0.843750000
+275it [00:36,  7.59it/s]
+P(y|x) 9:6600 loss=   0.432308018, acc=   0.828125000
+375it [00:49,  7.54it/s]
+P(y|x) 9:6700 loss=   0.288974941, acc=   0.890625000
+475it [01:02,  7.58it/s]
+P(y|x) 9:6800 loss=   0.254122764, acc=   0.906250000
+575it [01:15,  7.60it/s]
+P(y|x) 9:6900 loss=   0.485205293, acc=   0.828125000
+675it [01:29,  7.61it/s]
+P(y|x) 9:7000 loss=   0.374114931, acc=   0.875000000
+703it [01:32,  7.58it/s]
+Epoch 9: Train Loss 0.3238701820373535, Train Acc 0.887357771396637
+Epoch 9: Test Loss 0.39198970794677734, Test Acc 0.8686000108718872
+Epoch 9: Valid Loss 0.3938174843788147, Valid Acc 0.8676000237464905
+72it [00:09,  7.61it/s]
+P(y|x) 10:7100 loss=   0.400327623, acc=   0.828125000
+172it [00:22,  7.69it/s]
+P(y|x) 10:7200 loss=   0.358465046, acc=   0.890625000
+272it [00:35,  7.64it/s]
+P(y|x) 10:7300 loss=   0.251649320, acc=   0.890625000
+372it [00:48,  7.69it/s]
+P(y|x) 10:7400 loss=   0.446733356, acc=   0.859375000
+472it [01:01,  7.70it/s]
+P(y|x) 10:7500 loss=   0.230907157, acc=   0.968750000
+572it [01:15,  7.68it/s]
+P(y|x) 10:7600 loss=   0.351825565, acc=   0.875000000
+672it [01:28,  7.66it/s]
+P(y|x) 10:7700 loss=   0.344993591, acc=   0.875000000
+703it [01:32,  7.62it/s]
+Epoch 10: Train Loss 0.2999326288700104, Train Acc 0.8966705203056335
+Epoch 10: Test Loss 0.3902888596057892, Test Acc 0.8672000169754028
+Epoch 10: Valid Loss 0.3957291543483734, Valid Acc 0.8641999959945679
+69it [00:09,  7.59it/s]
+P(y|x) 11:7800 loss=   0.791682541, acc=   0.718750000
+169it [00:22,  7.62it/s]
+P(y|x) 11:7900 loss=   0.135265768, acc=   0.921875000
+269it [00:35,  7.52it/s]
+P(y|x) 11:8000 loss=   0.293585896, acc=   0.890625000
+369it [00:48,  7.60it/s]
+P(y|x) 11:8100 loss=   0.487910330, acc=   0.828125000
+469it [01:01,  7.62it/s]
+P(y|x) 11:8200 loss=   0.375131428, acc=   0.875000000
+569it [01:15,  7.64it/s]
+P(y|x) 11:8300 loss=   0.322008789, acc=   0.859375000
+669it [01:28,  7.64it/s]
+P(y|x) 11:8400 loss=   0.283149421, acc=   0.875000000
+703it [01:32,  7.58it/s]
+Epoch 11: Train Loss 0.3086467385292053, Train Acc 0.8930253982543945
+Epoch 11: Test Loss 0.4208553731441498, Test Acc 0.8605999946594238
+Epoch 11: Valid Loss 0.40498510003089905, Valid Acc 0.8619999885559082
+66it [00:08,  7.62it/s]
+P(y|x) 12:8500 loss=   0.418017745, acc=   0.812500000
+166it [00:22,  7.57it/s]
+P(y|x) 12:8600 loss=   0.199740827, acc=   0.937500000
+266it [00:35,  7.62it/s]
+P(y|x) 12:8700 loss=   0.414654493, acc=   0.843750000
+366it [00:48,  7.59it/s]
+P(y|x) 12:8800 loss=   0.302333236, acc=   0.906250000
+466it [01:01,  7.59it/s]
+P(y|x) 12:8900 loss=   0.402024925, acc=   0.921875000
+566it [01:14,  7.60it/s]
+P(y|x) 12:9000 loss=   0.239454493, acc=   0.937500000
+666it [01:27,  7.58it/s]
+P(y|x) 12:9100 loss=   0.320279807, acc=   0.890625000
+703it [01:32,  7.57it/s]
+Epoch 12: Train Loss 0.2662268579006195, Train Acc 0.9068723320960999
+Epoch 12: Test Loss 0.3626396358013153, Test Acc 0.8784000277519226
+Epoch 12: Valid Loss 0.3707856833934784, Valid Acc 0.8784000277519226
+63it [00:08,  7.60it/s]
+P(y|x) 13:9200 loss=   0.107401587, acc=   0.968750000
+163it [00:21,  7.59it/s]
+P(y|x) 13:9300 loss=   0.277163416, acc=   0.921875000
+263it [00:34,  7.58it/s]
+P(y|x) 13:9400 loss=   0.265065223, acc=   0.890625000
+363it [00:47,  7.59it/s]
+P(y|x) 13:9500 loss=   0.269826293, acc=   0.890625000
+463it [01:01,  7.64it/s]
+P(y|x) 13:9600 loss=   0.612124741, acc=   0.812500000
+563it [01:14,  7.61it/s]
+P(y|x) 13:9700 loss=   0.266991615, acc=   0.906250000
+663it [01:27,  7.63it/s]
+P(y|x) 13:9800 loss=   0.286120474, acc=   0.906250000
+703it [01:32,  7.58it/s]
+Epoch 13: Train Loss 0.25201845169067383, Train Acc 0.9137402176856995
+Epoch 13: Test Loss 0.37824881076812744, Test Acc 0.8763999938964844
+Epoch 13: Valid Loss 0.3730156719684601, Valid Acc 0.8773999810218811
+60it [00:08,  7.65it/s]
+P(y|x) 14:9900 loss=   0.236112595, acc=   0.953125000
+160it [00:21,  7.61it/s]
+P(y|x) 14:10000 loss=   0.289246947, acc=   0.859375000
+260it [00:34,  7.64it/s]
+P(y|x) 14:10100 loss=   0.326637775, acc=   0.859375000
+360it [00:47,  7.65it/s]
+P(y|x) 14:10200 loss=   0.413923502, acc=   0.781250000
+460it [01:00,  7.66it/s]
+P(y|x) 14:10300 loss=   0.258604199, acc=   0.875000000
+560it [01:13,  7.66it/s]
+P(y|x) 14:10400 loss=   0.400441825, acc=   0.843750000
+660it [01:26,  7.61it/s]
+P(y|x) 14:10500 loss=   0.185784698, acc=   0.937500000
+703it [01:32,  7.61it/s]
+Epoch 14: Train Loss 0.24604959785938263, Train Acc 0.9138291478157043
+Epoch 14: Test Loss 0.3621484935283661, Test Acc 0.880299985408783
+Epoch 14: Valid Loss 0.3826381266117096, Valid Acc 0.8769999742507935
+57it [00:07,  7.60it/s]
+P(y|x) 15:10600 loss=   0.164010018, acc=   0.953125000
+157it [00:20,  7.60it/s]
+P(y|x) 15:10700 loss=   0.160742193, acc=   0.937500000
+257it [00:33,  7.63it/s]
+P(y|x) 15:10800 loss=   0.273541361, acc=   0.875000000
+357it [00:47,  7.63it/s]
+P(y|x) 15:10900 loss=   0.229993105, acc=   0.921875000
+457it [01:00,  7.62it/s]
+P(y|x) 15:11000 loss=   0.166413695, acc=   0.968750000
+557it [01:13,  7.63it/s]
+P(y|x) 15:11100 loss=   0.175200939, acc=   0.968750000
+657it [01:26,  7.64it/s]
+P(y|x) 15:11200 loss=   0.358511895, acc=   0.843750000
+703it [01:32,  7.61it/s]
+Epoch 15: Train Loss 0.24308538436889648, Train Acc 0.9170741438865662
+Epoch 15: Test Loss 0.39309754967689514, Test Acc 0.8804000020027161
+Epoch 15: Valid Loss 0.416446715593338, Valid Acc 0.8722000122070312
+54it [00:07,  7.58it/s]
+P(y|x) 16:11300 loss=   0.305328190, acc=   0.921875000
+154it [00:20,  7.56it/s]
+P(y|x) 16:11400 loss=   0.227833465, acc=   0.921875000
+254it [00:33,  7.61it/s]
+P(y|x) 16:11500 loss=   0.222807601, acc=   0.890625000
+354it [00:46,  7.57it/s]
+P(y|x) 16:11600 loss=   0.311201900, acc=   0.937500000
+454it [00:59,  7.58it/s]
+P(y|x) 16:11700 loss=   0.289447039, acc=   0.859375000
+554it [01:13,  7.61it/s]
+P(y|x) 16:11800 loss=   0.219086513, acc=   0.921875000
+654it [01:26,  7.68it/s]
+P(y|x) 16:11900 loss=   0.151663780, acc=   0.953125000
+703it [01:32,  7.58it/s]
+Epoch 16: Train Loss 0.26733946800231934, Train Acc 0.9064055681228638
+Epoch 16: Test Loss 0.41461074352264404, Test Acc 0.8664000034332275
+Epoch 16: Valid Loss 0.42836132645606995, Valid Acc 0.8640000224113464
+51it [00:06,  7.56it/s]
+P(y|x) 17:12000 loss=   0.329942226, acc=   0.828125000
+151it [00:20,  7.55it/s]
+P(y|x) 17:12100 loss=   0.175822452, acc=   0.937500000
+251it [00:33,  7.54it/s]
+P(y|x) 17:12200 loss=   0.235436827, acc=   0.890625000
+351it [00:46,  7.54it/s]
+P(y|x) 17:12300 loss=   0.283351719, acc=   0.906250000
+451it [00:59,  7.58it/s]
+P(y|x) 17:12400 loss=   0.298565030, acc=   0.890625000
+551it [01:12,  7.58it/s]
+P(y|x) 17:12500 loss=   0.305790186, acc=   0.906250000
+651it [01:26,  7.59it/s]
+P(y|x) 17:12600 loss=   0.147595674, acc=   0.937500000
+703it [01:32,  7.56it/s]
+Epoch 17: Train Loss 0.24040815234184265, Train Acc 0.914607048034668
+Epoch 17: Test Loss 0.37783166766166687, Test Acc 0.8787000179290771
+Epoch 17: Valid Loss 0.38553309440612793, Valid Acc 0.876800000667572
+48it [00:06,  7.67it/s]
+P(y|x) 18:12700 loss=   0.178294256, acc=   0.953125000
+148it [00:19,  7.62it/s]
+P(y|x) 18:12800 loss=   0.313651145, acc=   0.921875000
+248it [00:32,  7.60it/s]
+P(y|x) 18:12900 loss=   0.292940438, acc=   0.906250000
+348it [00:45,  7.62it/s]
+P(y|x) 18:13000 loss=   0.369739056, acc=   0.890625000
+448it [00:59,  7.59it/s]
+P(y|x) 18:13100 loss=   0.354937226, acc=   0.859375000
+548it [01:12,  7.64it/s]
+P(y|x) 18:13200 loss=   0.086939082, acc=   0.984375000
+648it [01:25,  7.67it/s]
+P(y|x) 18:13300 loss=   0.248433977, acc=   0.937500000
+703it [01:32,  7.59it/s]
+Epoch 18: Train Loss 0.20882564783096313, Train Acc 0.9277427196502686
+Epoch 18: Test Loss 0.3608497679233551, Test Acc 0.8837000131607056
+Epoch 18: Valid Loss 0.3674015998840332, Valid Acc 0.8826000094413757
+45it [00:06,  7.63it/s]
+P(y|x) 19:13400 loss=   0.228310362, acc=   0.937500000
+145it [00:19,  7.63it/s]
+P(y|x) 19:13500 loss=   0.317355037, acc=   0.890625000
+245it [00:32,  7.61it/s]
+P(y|x) 19:13600 loss=   0.222740576, acc=   0.890625000
+345it [00:45,  7.58it/s]
+P(y|x) 19:13700 loss=   0.123720281, acc=   0.968750000
+445it [00:58,  7.58it/s]
+P(y|x) 19:13800 loss=   0.211092710, acc=   0.937500000
+545it [01:11,  7.59it/s]
+P(y|x) 19:13900 loss=   0.164900303, acc=   0.906250000
+645it [01:25,  7.67it/s]
+P(y|x) 19:14000 loss=   0.114192426, acc=   0.984375000
+703it [01:32,  7.58it/s]
+Epoch 19: Train Loss 0.20439276099205017, Train Acc 0.9285428524017334
+Epoch 19: Test Loss 0.3581458330154419, Test Acc 0.8823999762535095
+Epoch 19: Valid Loss 0.3628191351890564, Valid Acc 0.8838000297546387
+42it [00:05,  7.60it/s]
+P(y|x) 20:14100 loss=   0.203797162, acc=   0.937500000
+142it [00:18,  7.61it/s]
+P(y|x) 20:14200 loss=   0.117778838, acc=   0.953125000
+242it [00:32,  7.58it/s]
+P(y|x) 20:14300 loss=   0.167214960, acc=   0.953125000
+342it [00:45,  7.61it/s]
+P(y|x) 20:14400 loss=   0.249646753, acc=   0.890625000
+442it [00:58,  7.65it/s]
+P(y|x) 20:14500 loss=   0.224028379, acc=   0.953125000
+542it [01:11,  7.62it/s]
+P(y|x) 20:14600 loss=   0.181699902, acc=   0.953125000
+642it [01:24,  7.57it/s]
+P(y|x) 20:14700 loss=   0.241072997, acc=   0.906250000
+703it [01:32,  7.60it/s]
+Epoch 20: Train Loss 0.23833145201206207, Train Acc 0.9187411069869995
+Epoch 20: Test Loss 0.40146127343177795, Test Acc 0.8715000152587891
+Epoch 20: Valid Loss 0.39383620023727417, Valid Acc 0.875
+39it [00:05,  7.64it/s]
+P(y|x) 21:14800 loss=   0.175436586, acc=   0.937500000
+139it [00:18,  7.62it/s]
+P(y|x) 21:14900 loss=   0.155061007, acc=   0.937500000
+239it [00:31,  7.68it/s]
+P(y|x) 21:15000 loss=   0.108687177, acc=   0.968750000
+339it [00:44,  7.61it/s]
+P(y|x) 21:15100 loss=   0.325522244, acc=   0.906250000
+439it [00:57,  7.59it/s]
+P(y|x) 21:15200 loss=   0.099382907, acc=   0.968750000
+539it [01:11,  7.63it/s]
+P(y|x) 21:15300 loss=   0.308632612, acc=   0.859375000
+639it [01:24,  7.64it/s]
+P(y|x) 21:15400 loss=   0.221283585, acc=   0.875000000
+703it [01:32,  7.59it/s]
+Epoch 21: Train Loss 0.18200920522212982, Train Acc 0.9366776347160339
+Epoch 21: Test Loss 0.3434581458568573, Test Acc 0.892799973487854
+Epoch 21: Valid Loss 0.35523495078086853, Valid Acc 0.8898000121116638
+36it [00:04,  7.60it/s]
+P(y|x) 22:15500 loss=   0.317972600, acc=   0.906250000
+136it [00:18,  7.61it/s]
+P(y|x) 22:15600 loss=   0.203061491, acc=   0.906250000
+236it [00:31,  7.64it/s]
+P(y|x) 22:15700 loss=   0.226903960, acc=   0.953125000
+336it [00:44,  7.65it/s]
+P(y|x) 22:15800 loss=   0.245473713, acc=   0.906250000
+436it [00:57,  7.66it/s]
+P(y|x) 22:15900 loss=   0.242784530, acc=   0.875000000
+536it [01:10,  7.67it/s]
+P(y|x) 22:16000 loss=   0.126057282, acc=   0.937500000
+636it [01:23,  7.61it/s]
+P(y|x) 22:16100 loss=   0.186748207, acc=   0.906250000
+703it [01:32,  7.59it/s]
+Epoch 22: Train Loss 0.16265305876731873, Train Acc 0.9432343244552612
+Epoch 22: Test Loss 0.33697181940078735, Test Acc 0.8938000202178955
+Epoch 22: Valid Loss 0.3647473156452179, Valid Acc 0.8924000263214111
+33it [00:04,  7.64it/s]
+P(y|x) 23:16200 loss=   0.127700493, acc=   0.937500000
+133it [00:17,  7.66it/s]
+P(y|x) 23:16300 loss=   0.181446686, acc=   0.937500000
+233it [00:30,  7.65it/s]
+P(y|x) 23:16400 loss=   0.224515051, acc=   0.921875000
+333it [00:43,  7.58it/s]
+P(y|x) 23:16500 loss=   0.083820418, acc=   0.968750000
+433it [00:57,  7.60it/s]
+P(y|x) 23:16600 loss=   0.394581079, acc=   0.828125000
+533it [01:10,  7.65it/s]
+P(y|x) 23:16700 loss=   0.288703293, acc=   0.859375000
+633it [01:23,  7.66it/s]
+P(y|x) 23:16800 loss=   0.222441807, acc=   0.937500000
+703it [01:32,  7.60it/s]
+Epoch 23: Train Loss 0.15526869893074036, Train Acc 0.9458348155021667
+Epoch 23: Test Loss 0.3496418595314026, Test Acc 0.8930000066757202
+Epoch 23: Valid Loss 0.357043981552124, Valid Acc 0.8925999999046326
+30it [00:04,  7.60it/s]
+P(y|x) 24:16900 loss=   0.216188490, acc=   0.906250000
+130it [00:17,  7.67it/s]
+P(y|x) 24:17000 loss=   0.125432327, acc=   0.953125000
+230it [00:30,  7.62it/s]
+P(y|x) 24:17100 loss=   0.044030279, acc=   0.984375000
+330it [00:43,  7.53it/s]
+P(y|x) 24:17200 loss=   0.250344247, acc=   0.921875000
+430it [00:56,  7.67it/s]
+P(y|x) 24:17300 loss=   0.201414362, acc=   0.937500000
+530it [01:09,  7.62it/s]
+P(y|x) 24:17400 loss=   0.195997640, acc=   0.937500000
+630it [01:22,  7.61it/s]
+P(y|x) 24:17500 loss=   0.217680454, acc=   0.921875000
+703it [01:32,  7.60it/s]
+Epoch 24: Train Loss 0.18033114075660706, Train Acc 0.9375666975975037
+Epoch 24: Test Loss 0.3866986036300659, Test Acc 0.8899000287055969
+Epoch 24: Valid Loss 0.39932119846343994, Valid Acc 0.8895999789237976
+27it [00:03,  7.66it/s]
+P(y|x) 25:17600 loss=   0.142839074, acc=   0.937500000
+127it [00:16,  7.63it/s]
+P(y|x) 25:17700 loss=   0.151047379, acc=   0.921875000
+227it [00:29,  7.60it/s]
+P(y|x) 25:17800 loss=   0.223073274, acc=   0.906250000
+327it [00:43,  7.65it/s]
+P(y|x) 25:17900 loss=   0.215779781, acc=   0.937500000
+427it [00:56,  7.67it/s]
+P(y|x) 25:18000 loss=   0.251404971, acc=   0.906250000
+527it [01:09,  7.64it/s]
+P(y|x) 25:18100 loss=   0.107567839, acc=   0.968750000
+627it [01:22,  7.67it/s]
+P(y|x) 25:18200 loss=   0.196726561, acc=   0.906250000
+703it [01:32,  7.63it/s]
+Epoch 25: Train Loss 0.16878332197666168, Train Acc 0.941678524017334
+Epoch 25: Test Loss 0.3843327760696411, Test Acc 0.8920000195503235
+Epoch 25: Valid Loss 0.3979252576828003, Valid Acc 0.8938000202178955
+24it [00:03,  7.65it/s]
+P(y|x) 26:18300 loss=   0.278348953, acc=   0.921875000
+124it [00:16,  7.64it/s]
+P(y|x) 26:18400 loss=   0.037250251, acc=   1.000000000
+224it [00:29,  7.63it/s]
+P(y|x) 26:18500 loss=   0.132626846, acc=   0.968750000
+324it [00:42,  7.62it/s]
+P(y|x) 26:18600 loss=   0.231873810, acc=   0.921875000
+424it [00:55,  7.64it/s]
+P(y|x) 26:18700 loss=   0.192266792, acc=   0.921875000
+524it [01:08,  7.62it/s]
+P(y|x) 26:18800 loss=   0.221312851, acc=   0.968750000
+624it [01:21,  7.58it/s]
+P(y|x) 26:18900 loss=   0.194700986, acc=   0.953125000
+703it [01:32,  7.61it/s]
+Epoch 26: Train Loss 0.1317446082830429, Train Acc 0.9533472657203674
+Epoch 26: Test Loss 0.3462792634963989, Test Acc 0.8989999890327454
+Epoch 26: Valid Loss 0.363116979598999, Valid Acc 0.8998000025749207
+21it [00:02,  7.58it/s]
+P(y|x) 27:19000 loss=   0.150674567, acc=   0.937500000
+121it [00:16,  7.62it/s]
+P(y|x) 27:19100 loss=   0.143147483, acc=   0.921875000
+221it [00:29,  7.66it/s]
+P(y|x) 27:19200 loss=   0.176312953, acc=   0.921875000
+321it [00:42,  7.64it/s]
+P(y|x) 27:19300 loss=   0.039824501, acc=   0.984375000
+421it [00:55,  7.65it/s]
+P(y|x) 27:19400 loss=   0.207178771, acc=   0.921875000
+521it [01:08,  7.66it/s]
+P(y|x) 27:19500 loss=   0.210122257, acc=   0.921875000
+621it [01:21,  7.66it/s]
+P(y|x) 27:19600 loss=   0.187431157, acc=   0.906250000
+703it [01:32,  7.63it/s]
+Epoch 27: Train Loss 0.1239098459482193, Train Acc 0.9568589925765991
+Epoch 27: Test Loss 0.3433656692504883, Test Acc 0.8996000289916992
+Epoch 27: Valid Loss 0.3552549481391907, Valid Acc 0.9014000296592712
+18it [00:02,  7.67it/s]
+P(y|x) 28:19700 loss=   0.127672821, acc=   0.968750000
+118it [00:15,  7.58it/s]
+P(y|x) 28:19800 loss=   0.161238015, acc=   0.937500000
+218it [00:28,  7.63it/s]
+P(y|x) 28:19900 loss=   0.180759251, acc=   0.968750000
+318it [00:41,  7.63it/s]
+P(y|x) 28:20000 loss=   0.093682855, acc=   0.968750000
+418it [00:55,  7.61it/s]
+P(y|x) 28:20100 loss=   0.203213453, acc=   0.906250000
+518it [01:08,  7.61it/s]
+P(y|x) 28:20200 loss=   0.142839313, acc=   0.937500000
+618it [01:21,  7.64it/s]
+P(y|x) 28:20300 loss=   0.147242248, acc=   0.937500000
+703it [01:32,  7.60it/s]
+Epoch 28: Train Loss 0.15401005744934082, Train Acc 0.9461681842803955
+Epoch 28: Test Loss 0.3805234432220459, Test Acc 0.8921999931335449
+Epoch 28: Valid Loss 0.3820720314979553, Valid Acc 0.8960000276565552
+15it [00:02,  7.65it/s]
+P(y|x) 29:20400 loss=   0.049210772, acc=   0.968750000
+115it [00:15,  7.66it/s]
+P(y|x) 29:20500 loss=   0.199369699, acc=   0.906250000
+215it [00:28,  7.66it/s]
+P(y|x) 29:20600 loss=   0.190720856, acc=   0.921875000
+315it [00:41,  7.68it/s]
+P(y|x) 29:20700 loss=   0.145898268, acc=   0.953125000
+415it [00:54,  7.66it/s]
+P(y|x) 29:20800 loss=   0.147491083, acc=   0.968750000
+515it [01:07,  7.64it/s]
+P(y|x) 29:20900 loss=   0.143612191, acc=   0.937500000
+615it [01:20,  7.64it/s]
+P(y|x) 29:21000 loss=   0.099053413, acc=   0.968750000
+703it [01:31,  7.64it/s]
+Epoch 29: Train Loss 0.1316097527742386, Train Acc 0.9535695314407349
+Epoch 29: Test Loss 0.34821486473083496, Test Acc 0.8974000215530396
+Epoch 29: Valid Loss 0.34002500772476196, Valid Acc 0.9047999978065491
+12it [00:01,  7.59it/s]
+P(y|x) 30:21100 loss=   0.087768912, acc=   0.968750000
+112it [00:14,  7.66it/s]
+P(y|x) 30:21200 loss=   0.086915307, acc=   0.953125000
+212it [00:27,  7.67it/s]
+P(y|x) 30:21300 loss=   0.095530964, acc=   0.953125000
+312it [00:40,  7.68it/s]
+P(y|x) 30:21400 loss=   0.120082207, acc=   0.937500000
+412it [00:53,  7.69it/s]
+P(y|x) 30:21500 loss=   0.099216640, acc=   0.968750000
+512it [01:06,  7.67it/s]
+P(y|x) 30:21600 loss=   0.110451013, acc=   0.968750000
+612it [01:19,  7.67it/s]
+P(y|x) 30:21700 loss=   0.241185427, acc=   0.937500000
+703it [01:31,  7.65it/s]
+Epoch 30: Train Loss 0.1115201935172081, Train Acc 0.9602596163749695
+Epoch 30: Test Loss 0.33318743109703064, Test Acc 0.9014000296592712
+Epoch 30: Valid Loss 0.3496544361114502, Valid Acc 0.8953999876976013
+9it [00:01,  7.32it/s]
+P(y|x) 31:21800 loss=   0.202220708, acc=   0.937500000
+109it [00:14,  7.61it/s]
+P(y|x) 31:21900 loss=   0.054712094, acc=   0.984375000
+209it [00:27,  7.64it/s]
+P(y|x) 31:22000 loss=   0.074509330, acc=   0.984375000
+309it [00:40,  7.67it/s]
+P(y|x) 31:22100 loss=   0.140153974, acc=   0.937500000
+409it [00:53,  7.64it/s]
+P(y|x) 31:22200 loss=   0.104190379, acc=   0.953125000
+509it [01:06,  7.61it/s]
+P(y|x) 31:22300 loss=   0.217010990, acc=   0.906250000
+609it [01:20,  7.64it/s]
+P(y|x) 31:22400 loss=   0.126452595, acc=   0.937500000
+703it [01:32,  7.60it/s]
+Epoch 31: Train Loss 0.10178551077842712, Train Acc 0.9646159410476685
+Epoch 31: Test Loss 0.339800626039505, Test Acc 0.902999997138977
+Epoch 31: Valid Loss 0.35575708746910095, Valid Acc 0.9043999910354614
+6it [00:01,  6.80it/s]
+P(y|x) 32:22500 loss=   0.040503301, acc=   1.000000000
+106it [00:14,  7.63it/s]
+P(y|x) 32:22600 loss=   0.080282569, acc=   0.968750000
+206it [00:27,  7.59it/s]
+P(y|x) 32:22700 loss=   0.234299645, acc=   0.937500000
+306it [00:40,  7.63it/s]
+P(y|x) 32:22800 loss=   0.166028768, acc=   0.921875000
+406it [00:53,  7.65it/s]
+P(y|x) 32:22900 loss=   0.103298470, acc=   0.968750000
+506it [01:06,  7.71it/s]
+P(y|x) 32:23000 loss=   0.123054788, acc=   0.968750000
+606it [01:19,  7.68it/s]
+P(y|x) 32:23100 loss=   0.141469762, acc=   0.937500000
+703it [01:32,  7.62it/s]
+Epoch 32: Train Loss 0.1119774803519249, Train Acc 0.960748553276062
+Epoch 32: Test Loss 0.33433690667152405, Test Acc 0.8996000289916992
+Epoch 32: Valid Loss 0.3574844300746918, Valid Acc 0.8974000215530396
+3it [00:00,  5.25it/s]
+P(y|x) 33:23200 loss=   0.158802375, acc=   0.968750000
+103it [00:13,  7.65it/s]
+P(y|x) 33:23300 loss=   0.272081643, acc=   0.937500000
+203it [00:26,  7.65it/s]
+P(y|x) 33:23400 loss=   0.085079975, acc=   0.968750000
+303it [00:39,  7.65it/s]
+P(y|x) 33:23500 loss=   0.078206107, acc=   0.984375000
+403it [00:52,  7.65it/s]
+P(y|x) 33:23600 loss=   0.078198753, acc=   0.984375000
+503it [01:06,  7.65it/s]
+P(y|x) 33:23700 loss=   0.168566719, acc=   0.921875000
+603it [01:19,  7.64it/s]
+P(y|x) 33:23800 loss=   0.076106146, acc=   0.968750000
+703it [01:32,  7.61it/s]
+P(y|x) 33:23900 loss=   0.143912524, acc=   0.921875000
+
+Epoch 33: Train Loss 0.10411018878221512, Train Acc 0.9634379148483276
+Epoch 33: Test Loss 0.34890255331993103, Test Acc 0.902999997138977
+Epoch 33: Valid Loss 0.3615933954715729, Valid Acc 0.9017999768257141
+100it [00:13,  7.61it/s]
+P(y|x) 34:24000 loss=   0.133071944, acc=   0.937500000
+200it [00:26,  7.65it/s]
+P(y|x) 34:24100 loss=   0.086514980, acc=   0.953125000
+300it [00:39,  7.63it/s]
+P(y|x) 34:24200 loss=   0.197206959, acc=   0.953125000
+400it [00:52,  7.63it/s]
+P(y|x) 34:24300 loss=   0.127437711, acc=   0.953125000
+500it [01:05,  7.66it/s]
+P(y|x) 34:24400 loss=   0.188234881, acc=   0.937500000
+600it [01:18,  7.65it/s]
+P(y|x) 34:24500 loss=   0.058749609, acc=   0.984375000
+700it [01:31,  7.67it/s]
+P(y|x) 34:24600 loss=   0.115597822, acc=   0.968750000
+703it [01:32,  7.62it/s]
+Epoch 34: Train Loss 0.13160385191440582, Train Acc 0.9540807008743286
+Epoch 34: Test Loss 0.4029330611228943, Test Acc 0.8930000066757202
+Epoch 34: Valid Loss 0.3941243588924408, Valid Acc 0.8939999938011169
+97it [00:12,  7.61it/s]
+P(y|x) 35:24700 loss=   0.146191195, acc=   0.953125000
+197it [00:26,  7.63it/s]
+P(y|x) 35:24800 loss=   0.097220466, acc=   0.968750000
+297it [00:39,  7.63it/s]
+P(y|x) 35:24900 loss=   0.092870787, acc=   0.968750000
+397it [00:52,  7.60it/s]
+P(y|x) 35:25000 loss=   0.098881081, acc=   0.953125000
+497it [01:05,  7.63it/s]
+P(y|x) 35:25100 loss=   0.150361180, acc=   0.937500000
+597it [01:18,  7.66it/s]
+P(y|x) 35:25200 loss=   0.127031595, acc=   0.937500000
+697it [01:31,  7.63it/s]
+P(y|x) 35:25300 loss=   0.052099228, acc=   0.984375000
+703it [01:32,  7.61it/s]
+Epoch 35: Train Loss 0.16454553604125977, Train Acc 0.9446123838424683
+Epoch 35: Test Loss 0.47191834449768066, Test Acc 0.8820000290870667
+Epoch 35: Valid Loss 0.46423226594924927, Valid Acc 0.8848000168800354
+94it [00:12,  7.60it/s]
+P(y|x) 36:25400 loss=   0.147241846, acc=   0.984375000
+194it [00:25,  7.65it/s]
+P(y|x) 36:25500 loss=   0.103001259, acc=   0.968750000
+294it [00:38,  7.66it/s]
+P(y|x) 36:25600 loss=   0.051657528, acc=   0.984375000
+394it [00:51,  7.61it/s]
+P(y|x) 36:25700 loss=   0.141899303, acc=   0.953125000
+494it [01:04,  7.63it/s]
+P(y|x) 36:25800 loss=   0.062598608, acc=   0.984375000
+594it [01:17,  7.65it/s]
+P(y|x) 36:25900 loss=   0.164348990, acc=   0.953125000
+694it [01:31,  7.61it/s]
+P(y|x) 36:26000 loss=   0.069889620, acc=   0.968750000
+703it [01:32,  7.61it/s]
+Epoch 36: Train Loss 0.09532548487186432, Train Acc 0.9669497013092041
+Epoch 36: Test Loss 0.3452832102775574, Test Acc 0.9054999947547913
+Epoch 36: Valid Loss 0.34968167543411255, Valid Acc 0.9038000106811523
+91it [00:12,  7.64it/s]
+P(y|x) 37:26100 loss=   0.191823289, acc=   0.968750000
+191it [00:25,  7.68it/s]
+P(y|x) 37:26200 loss=   0.188080609, acc=   0.937500000
+291it [00:38,  7.67it/s]
+P(y|x) 37:26300 loss=   0.283203125, acc=   0.859375000
+391it [00:51,  7.67it/s]
+P(y|x) 37:26400 loss=   0.249848947, acc=   0.937500000
+491it [01:04,  7.71it/s]
+P(y|x) 37:26500 loss=   0.147676453, acc=   0.937500000
+591it [01:17,  7.67it/s]
+P(y|x) 37:26600 loss=   0.049826030, acc=   0.984375000
+691it [01:30,  7.72it/s]
+P(y|x) 37:26700 loss=   0.081784420, acc=   0.968750000
+703it [01:32,  7.61it/s]
+Epoch 37: Train Loss 0.1530783623456955, Train Acc 0.9451457858085632
+Epoch 37: Test Loss 0.42238184809684753, Test Acc 0.8884999752044678
+Epoch 37: Valid Loss 0.44477391242980957, Valid Acc 0.8858000040054321
+88it [00:11,  7.66it/s]
+P(y|x) 38:26800 loss=   0.054798856, acc=   0.984375000
+188it [00:24,  7.68it/s]
+P(y|x) 38:26900 loss=   0.112200506, acc=   0.953125000
+288it [00:37,  7.74it/s]
+P(y|x) 38:27000 loss=   0.112878606, acc=   0.968750000
+388it [00:50,  7.64it/s]
+P(y|x) 38:27100 loss=   0.372901350, acc=   0.906250000
+488it [01:03,  7.68it/s]
+P(y|x) 38:27200 loss=   0.091238871, acc=   0.968750000
+588it [01:16,  7.65it/s]
+P(y|x) 38:27300 loss=   0.045498863, acc=   1.000000000
+688it [01:30,  7.59it/s]
+P(y|x) 38:27400 loss=   0.120295592, acc=   0.937500000
+703it [01:32,  7.64it/s]
+Epoch 38: Train Loss 0.12807002663612366, Train Acc 0.9545029997825623
+Epoch 38: Test Loss 0.3851124942302704, Test Acc 0.8896999955177307
+Epoch 38: Valid Loss 0.3790903687477112, Valid Acc 0.895799994468689
+85it [00:11,  7.62it/s]
+P(y|x) 39:27500 loss=   0.140279606, acc=   0.937500000
+185it [00:24,  7.60it/s]
+P(y|x) 39:27600 loss=   0.020010054, acc=   1.000000000
+285it [00:37,  7.63it/s]
+P(y|x) 39:27700 loss=   0.048599400, acc=   0.984375000
+385it [00:50,  7.66it/s]
+P(y|x) 39:27800 loss=   0.171130836, acc=   0.968750000
+485it [01:04,  7.60it/s]
+P(y|x) 39:27900 loss=   0.072727919, acc=   0.984375000
+585it [01:17,  7.55it/s]
+P(y|x) 39:28000 loss=   0.194191247, acc=   0.937500000
+685it [01:30,  7.61it/s]
+P(y|x) 39:28100 loss=   0.024865210, acc=   1.000000000
+703it [01:32,  7.58it/s]
+Epoch 39: Train Loss 0.07534141838550568, Train Acc 0.9731730222702026
+Epoch 39: Test Loss 0.3512575328350067, Test Acc 0.9054999947547913
+Epoch 39: Valid Loss 0.3422831892967224, Valid Acc 0.9111999869346619
+82it [00:11,  7.49it/s]
+P(y|x) 40:28200 loss=   0.160357103, acc=   0.921875000
+182it [00:24,  7.62it/s]
+P(y|x) 40:28300 loss=   0.098144375, acc=   0.968750000
+282it [00:37,  7.61it/s]
+P(y|x) 40:28400 loss=   0.116047628, acc=   0.968750000
+382it [00:50,  7.61it/s]
+P(y|x) 40:28500 loss=   0.079902411, acc=   0.968750000
+482it [01:03,  7.64it/s]
+P(y|x) 40:28600 loss=   0.062380224, acc=   0.968750000
+582it [01:16,  7.59it/s]
+P(y|x) 40:28700 loss=   0.039727859, acc=   0.984375000
+682it [01:29,  7.62it/s]
+P(y|x) 40:28800 loss=   0.326685131, acc=   0.890625000
+703it [01:32,  7.59it/s]
+Epoch 40: Train Loss 0.1076715961098671, Train Acc 0.9609708189964294
+Epoch 40: Test Loss 0.39665311574935913, Test Acc 0.8924000263214111
+Epoch 40: Valid Loss 0.4266318380832672, Valid Acc 0.8952000141143799
+79it [00:10,  7.66it/s]
+P(y|x) 41:28900 loss=   0.015298940, acc=   1.000000000
+179it [00:23,  7.60it/s]
+P(y|x) 41:29000 loss=   0.065836191, acc=   0.968750000
+279it [00:36,  7.61it/s]
+P(y|x) 41:29100 loss=   0.040799342, acc=   0.984375000
+379it [00:49,  7.61it/s]
+P(y|x) 41:29200 loss=   0.094466701, acc=   0.953125000
+479it [01:03,  7.60it/s]
+P(y|x) 41:29300 loss=   0.164104059, acc=   0.937500000
+579it [01:16,  7.65it/s]
+P(y|x) 41:29400 loss=   0.116116837, acc=   0.953125000
+679it [01:29,  7.67it/s]
+P(y|x) 41:29500 loss=   0.207182139, acc=   0.906250000
+703it [01:32,  7.59it/s]
+Epoch 41: Train Loss 0.07878177613019943, Train Acc 0.9730396270751953
+Epoch 41: Test Loss 0.3394693434238434, Test Acc 0.9024999737739563
+Epoch 41: Valid Loss 0.3350535035133362, Valid Acc 0.9067999720573425
+76it [00:10,  7.64it/s]
+P(y|x) 42:29600 loss=   0.101709105, acc=   0.968750000
+176it [00:23,  7.67it/s]
+P(y|x) 42:29700 loss=   0.049412325, acc=   0.968750000
+276it [00:36,  7.64it/s]
+P(y|x) 42:29800 loss=   0.172327191, acc=   0.937500000
+376it [00:49,  7.64it/s]
+P(y|x) 42:29900 loss=   0.266003579, acc=   0.953125000
+476it [01:02,  7.64it/s]
+P(y|x) 42:30000 loss=   0.079154782, acc=   0.984375000
+576it [01:15,  7.65it/s]
+P(y|x) 42:30100 loss=   0.224628732, acc=   0.953125000
+676it [01:28,  7.67it/s]
+P(y|x) 42:30200 loss=   0.141770869, acc=   0.953125000
+703it [01:32,  7.61it/s]
+Epoch 42: Train Loss 0.09720543026924133, Train Acc 0.9659273028373718
+Epoch 42: Test Loss 0.3669474124908447, Test Acc 0.9003000259399414
+Epoch 42: Valid Loss 0.3858599066734314, Valid Acc 0.9010000228881836
+73it [00:09,  7.57it/s]
+P(y|x) 43:30300 loss=   0.056206547, acc=   0.968750000
+173it [00:22,  7.62it/s]
+P(y|x) 43:30400 loss=   0.129239500, acc=   0.968750000
+273it [00:36,  7.58it/s]
+P(y|x) 43:30500 loss=   0.191368356, acc=   0.937500000
+373it [00:49,  7.61it/s]
+P(y|x) 43:30600 loss=   0.072717726, acc=   0.953125000
+473it [01:02,  7.61it/s]
+P(y|x) 43:30700 loss=   0.114670403, acc=   0.968750000
+573it [01:15,  7.62it/s]
+P(y|x) 43:30800 loss=   0.074606970, acc=   0.984375000
+673it [01:28,  7.60it/s]
+P(y|x) 43:30900 loss=   0.201344967, acc=   0.906250000
+703it [01:32,  7.59it/s]
+Epoch 43: Train Loss 0.13943789899349213, Train Acc 0.9523693323135376
+Epoch 43: Test Loss 0.4401922821998596, Test Acc 0.8867999911308289
+Epoch 43: Valid Loss 0.46471473574638367, Valid Acc 0.8870000243186951
+70it [00:09,  7.63it/s]
+P(y|x) 44:31000 loss=   0.040765375, acc=   0.984375000
+170it [00:22,  7.63it/s]
+P(y|x) 44:31100 loss=   0.043853909, acc=   0.984375000
+270it [00:35,  7.56it/s]
+P(y|x) 44:31200 loss=   0.056536190, acc=   0.968750000
+370it [00:48,  7.57it/s]
+P(y|x) 44:31300 loss=   0.154203504, acc=   0.937500000
+470it [01:02,  7.61it/s]
+P(y|x) 44:31400 loss=   0.160787076, acc=   0.937500000
+570it [01:15,  7.62it/s]
+P(y|x) 44:31500 loss=   0.246876478, acc=   0.937500000
+670it [01:28,  7.62it/s]
+P(y|x) 44:31600 loss=   0.056476444, acc=   0.968750000
+703it [01:32,  7.59it/s]
+Epoch 44: Train Loss 0.0782950147986412, Train Acc 0.9717060923576355
+Epoch 44: Test Loss 0.37403592467308044, Test Acc 0.9039999842643738
+Epoch 44: Valid Loss 0.3638480305671692, Valid Acc 0.9067999720573425
+67it [00:09,  7.61it/s]
+P(y|x) 45:31700 loss=   0.073143236, acc=   0.968750000
+167it [00:22,  7.63it/s]
+P(y|x) 45:31800 loss=   0.094870389, acc=   0.968750000
+267it [00:35,  7.65it/s]
+P(y|x) 45:31900 loss=   0.036475070, acc=   0.984375000
+367it [00:48,  7.64it/s]
+P(y|x) 45:32000 loss=   0.087108731, acc=   0.953125000
+467it [01:01,  7.61it/s]
+P(y|x) 45:32100 loss=   0.087751321, acc=   0.968750000
+567it [01:14,  7.59it/s]
+P(y|x) 45:32200 loss=   0.134817019, acc=   0.937500000
+667it [01:27,  7.67it/s]
+P(y|x) 45:32300 loss=   0.127497226, acc=   0.968750000
+703it [01:32,  7.60it/s]
+Epoch 45: Train Loss 0.06974367797374725, Train Acc 0.9764624834060669
+Epoch 45: Test Loss 0.35457560420036316, Test Acc 0.9067000150680542
+Epoch 45: Valid Loss 0.3419813811779022, Valid Acc 0.9132000207901001
+64it [00:08,  7.63it/s]
+P(y|x) 46:32400 loss=   0.033710122, acc=   1.000000000
+164it [00:21,  7.62it/s]
+P(y|x) 46:32500 loss=   0.220850348, acc=   0.921875000
+264it [00:34,  7.68it/s]
+P(y|x) 46:32600 loss=   0.142967731, acc=   0.906250000
+364it [00:47,  7.64it/s]
+P(y|x) 46:32700 loss=   0.154213503, acc=   0.953125000
+464it [01:00,  7.66it/s]
+P(y|x) 46:32800 loss=   0.131669492, acc=   0.921875000
+564it [01:13,  7.66it/s]
+P(y|x) 46:32900 loss=   0.190758556, acc=   0.968750000
+664it [01:26,  7.65it/s]
+P(y|x) 46:33000 loss=   0.012376465, acc=   1.000000000
+703it [01:32,  7.64it/s]
+Epoch 46: Train Loss 0.08975110203027725, Train Acc 0.9681276679039001
+Epoch 46: Test Loss 0.40311938524246216, Test Acc 0.9021999835968018
+Epoch 46: Valid Loss 0.4189332127571106, Valid Acc 0.8996000289916992
+61it [00:08,  7.58it/s]
+P(y|x) 47:33100 loss=   0.025736369, acc=   0.984375000
+161it [00:21,  7.60it/s]
+P(y|x) 47:33200 loss=   0.026028834, acc=   1.000000000
+261it [00:34,  7.63it/s]
+P(y|x) 47:33300 loss=   0.087641686, acc=   0.984375000
+361it [00:47,  7.60it/s]
+P(y|x) 47:33400 loss=   0.114614278, acc=   0.968750000
+461it [01:00,  7.66it/s]
+P(y|x) 47:33500 loss=   0.102284260, acc=   0.953125000
+561it [01:13,  7.68it/s]
+P(y|x) 47:33600 loss=   0.091792464, acc=   0.968750000
+661it [01:26,  7.74it/s]
+P(y|x) 47:33700 loss=   0.036539108, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 47: Train Loss 0.08935795724391937, Train Acc 0.9689944982528687
+Epoch 47: Test Loss 0.39154261350631714, Test Acc 0.8998000025749207
+Epoch 47: Valid Loss 0.4016178250312805, Valid Acc 0.8985999822616577
+58it [00:07,  7.65it/s]
+P(y|x) 48:33800 loss=   0.054308530, acc=   0.968750000
+158it [00:20,  7.53it/s]
+P(y|x) 48:33900 loss=   0.083034754, acc=   0.937500000
+258it [00:33,  7.66it/s]
+P(y|x) 48:34000 loss=   0.054724231, acc=   0.968750000
+358it [00:47,  7.63it/s]
+P(y|x) 48:34100 loss=   0.062458470, acc=   0.984375000
+458it [01:00,  7.64it/s]
+P(y|x) 48:34200 loss=   0.227328211, acc=   0.953125000
+558it [01:13,  7.71it/s]
+P(y|x) 48:34300 loss=   0.081552647, acc=   0.953125000
+658it [01:26,  7.65it/s]
+P(y|x) 48:34400 loss=   0.040397100, acc=   1.000000000
+703it [01:32,  7.62it/s]
+Epoch 48: Train Loss 0.06619666516780853, Train Acc 0.9766847491264343
+Epoch 48: Test Loss 0.371913880109787, Test Acc 0.9067999720573425
+Epoch 48: Valid Loss 0.34539228677749634, Valid Acc 0.9143999814987183
+55it [00:07,  7.59it/s]
+P(y|x) 49:34500 loss=   0.042864569, acc=   0.984375000
+155it [00:20,  7.56it/s]
+P(y|x) 49:34600 loss=   0.016037740, acc=   1.000000000
+255it [00:33,  7.69it/s]
+P(y|x) 49:34700 loss=   0.107957251, acc=   0.968750000
+355it [00:46,  7.68it/s]
+P(y|x) 49:34800 loss=   0.224358827, acc=   0.953125000
+455it [00:59,  7.61it/s]
+P(y|x) 49:34900 loss=   0.106010169, acc=   0.984375000
+555it [01:12,  7.66it/s]
+P(y|x) 49:35000 loss=   0.090133555, acc=   0.968750000
+655it [01:25,  7.67it/s]
+P(y|x) 49:35100 loss=   0.080695070, acc=   0.984375000
+703it [01:32,  7.64it/s]
+Epoch 49: Train Loss 0.06235283240675926, Train Acc 0.978285014629364
+Epoch 49: Test Loss 0.37158700823783875, Test Acc 0.9082000255584717
+Epoch 49: Valid Loss 0.39463233947753906, Valid Acc 0.907800018787384
+52it [00:07,  7.65it/s]
+P(y|x) 50:35200 loss=   0.025861725, acc=   1.000000000
+152it [00:20,  7.60it/s]
+P(y|x) 50:35300 loss=   0.294852048, acc=   0.890625000
+252it [00:33,  7.63it/s]
+P(y|x) 50:35400 loss=   0.061719816, acc=   0.968750000
+352it [00:46,  7.58it/s]
+P(y|x) 50:35500 loss=   0.159800991, acc=   0.937500000
+452it [00:59,  7.58it/s]
+P(y|x) 50:35600 loss=   0.126374424, acc=   0.953125000
+552it [01:12,  7.63it/s]
+P(y|x) 50:35700 loss=   0.168238908, acc=   0.953125000
+652it [01:25,  7.62it/s]
+P(y|x) 50:35800 loss=   0.034256130, acc=   1.000000000
+703it [01:32,  7.60it/s]
+Epoch 50: Train Loss 0.063557468354702, Train Acc 0.9778404831886292
+Epoch 50: Test Loss 0.36479613184928894, Test Acc 0.9115999937057495
+Epoch 50: Valid Loss 0.3545442819595337, Valid Acc 0.9103999733924866
+49it [00:06,  7.61it/s]
+P(y|x) 51:35900 loss=   0.180951625, acc=   0.937500000
+149it [00:19,  7.62it/s]
+P(y|x) 51:36000 loss=   0.073976763, acc=   0.953125000
+249it [00:32,  7.66it/s]
+P(y|x) 51:36100 loss=   0.060063645, acc=   0.968750000
+349it [00:45,  7.64it/s]
+P(y|x) 51:36200 loss=   0.020507753, acc=   1.000000000
+449it [00:58,  7.68it/s]
+P(y|x) 51:36300 loss=   0.132752270, acc=   0.937500000
+549it [01:12,  7.67it/s]
+P(y|x) 51:36400 loss=   0.071056604, acc=   0.984375000
+649it [01:25,  7.68it/s]
+P(y|x) 51:36500 loss=   0.071875364, acc=   0.968750000
+703it [01:32,  7.63it/s]
+Epoch 51: Train Loss 0.07517711073160172, Train Acc 0.9748622179031372
+Epoch 51: Test Loss 0.37682101130485535, Test Acc 0.9045000076293945
+Epoch 51: Valid Loss 0.37211841344833374, Valid Acc 0.9103999733924866
+46it [00:06,  7.64it/s]
+P(y|x) 52:36600 loss=   0.103939623, acc=   0.953125000
+146it [00:19,  7.67it/s]
+P(y|x) 52:36700 loss=   0.143213913, acc=   0.968750000
+246it [00:32,  7.61it/s]
+P(y|x) 52:36800 loss=   0.116788208, acc=   0.984375000
+346it [00:45,  7.69it/s]
+P(y|x) 52:36900 loss=   0.099559039, acc=   0.968750000
+446it [00:58,  7.70it/s]
+P(y|x) 52:37000 loss=   0.015644602, acc=   1.000000000
+546it [01:11,  7.70it/s]
+P(y|x) 52:37100 loss=   0.116362542, acc=   0.968750000
+646it [01:24,  7.65it/s]
+P(y|x) 52:37200 loss=   0.078294866, acc=   0.953125000
+703it [01:31,  7.64it/s]
+Epoch 52: Train Loss 0.08908805251121521, Train Acc 0.9697723984718323
+Epoch 52: Test Loss 0.4100307524204254, Test Acc 0.9024999737739563
+Epoch 52: Valid Loss 0.41096562147140503, Valid Acc 0.9021999835968018
+43it [00:05,  7.60it/s]
+P(y|x) 53:37300 loss=   0.097149037, acc=   0.968750000
+143it [00:18,  7.59it/s]
+P(y|x) 53:37400 loss=   0.039651148, acc=   0.984375000
+243it [00:32,  7.65it/s]
+P(y|x) 53:37500 loss=   0.154106408, acc=   0.937500000
+343it [00:45,  7.60it/s]
+P(y|x) 53:37600 loss=   0.032664701, acc=   0.984375000
+443it [00:58,  7.62it/s]
+P(y|x) 53:37700 loss=   0.048635557, acc=   0.968750000
+543it [01:11,  7.62it/s]
+P(y|x) 53:37800 loss=   0.026982646, acc=   0.984375000
+643it [01:24,  7.57it/s]
+P(y|x) 53:37900 loss=   0.137191668, acc=   0.953125000
+703it [01:32,  7.59it/s]
+Epoch 53: Train Loss 0.08146817982196808, Train Acc 0.9717060923576355
+Epoch 53: Test Loss 0.4294874966144562, Test Acc 0.9042999744415283
+Epoch 53: Valid Loss 0.43299683928489685, Valid Acc 0.9047999978065491
+40it [00:05,  7.64it/s]
+P(y|x) 54:38000 loss=   0.010859415, acc=   1.000000000
+140it [00:18,  7.67it/s]
+P(y|x) 54:38100 loss=   0.189958394, acc=   0.937500000
+240it [00:31,  7.73it/s]
+P(y|x) 54:38200 loss=   0.147262365, acc=   0.937500000
+340it [00:44,  7.65it/s]
+P(y|x) 54:38300 loss=   0.059980772, acc=   0.968750000
+440it [00:57,  7.66it/s]
+P(y|x) 54:38400 loss=   0.170617968, acc=   0.937500000
+540it [01:10,  7.66it/s]
+P(y|x) 54:38500 loss=   0.209458664, acc=   0.937500000
+640it [01:23,  7.72it/s]
+P(y|x) 54:38600 loss=   0.045222320, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 54: Train Loss 0.06818071007728577, Train Acc 0.9761291146278381
+Epoch 54: Test Loss 0.4010991156101227, Test Acc 0.9085999727249146
+Epoch 54: Valid Loss 0.40156620740890503, Valid Acc 0.9101999998092651
+37it [00:05,  7.70it/s]
+P(y|x) 55:38700 loss=   0.050751977, acc=   0.984375000
+137it [00:18,  7.72it/s]
+P(y|x) 55:38800 loss=   0.196739882, acc=   0.937500000
+237it [00:31,  7.68it/s]
+P(y|x) 55:38900 loss=   0.153630510, acc=   0.953125000
+337it [00:44,  7.73it/s]
+P(y|x) 55:39000 loss=   0.097709313, acc=   0.968750000
+437it [00:57,  7.72it/s]
+P(y|x) 55:39100 loss=   0.102638490, acc=   0.953125000
+537it [01:10,  7.66it/s]
+P(y|x) 55:39200 loss=   0.055109363, acc=   0.984375000
+637it [01:23,  7.64it/s]
+P(y|x) 55:39300 loss=   0.008310772, acc=   1.000000000
+703it [01:31,  7.65it/s]
+Epoch 55: Train Loss 0.0903341993689537, Train Acc 0.967838704586029
+Epoch 55: Test Loss 0.3876006305217743, Test Acc 0.9014000296592712
+Epoch 55: Valid Loss 0.39659810066223145, Valid Acc 0.8970000147819519
+34it [00:04,  7.64it/s]
+P(y|x) 56:39400 loss=   0.095959574, acc=   0.968750000
+134it [00:17,  7.65it/s]
+P(y|x) 56:39500 loss=   0.143165410, acc=   0.968750000
+234it [00:30,  7.67it/s]
+P(y|x) 56:39600 loss=   0.020269096, acc=   0.984375000
+334it [00:43,  7.72it/s]
+P(y|x) 56:39700 loss=   0.029658206, acc=   0.984375000
+434it [00:56,  7.65it/s]
+P(y|x) 56:39800 loss=   0.013756171, acc=   1.000000000
+534it [01:09,  7.65it/s]
+P(y|x) 56:39900 loss=   0.183859393, acc=   0.906250000
+634it [01:22,  7.65it/s]
+P(y|x) 56:40000 loss=   0.045850664, acc=   0.984375000
+703it [01:31,  7.65it/s]
+Epoch 56: Train Loss 0.07162486761808395, Train Acc 0.9759512543678284
+Epoch 56: Test Loss 0.4356309175491333, Test Acc 0.906499981880188
+Epoch 56: Valid Loss 0.4536312520503998, Valid Acc 0.9003999829292297
+31it [00:04,  7.63it/s]
+P(y|x) 57:40100 loss=   0.011782661, acc=   1.000000000
+131it [00:17,  7.69it/s]
+P(y|x) 57:40200 loss=   0.014284864, acc=   1.000000000
+231it [00:30,  7.67it/s]
+P(y|x) 57:40300 loss=   0.070034079, acc=   0.953125000
+331it [00:43,  7.66it/s]
+P(y|x) 57:40400 loss=   0.013263613, acc=   1.000000000
+431it [00:56,  7.66it/s]
+P(y|x) 57:40500 loss=   0.028759331, acc=   0.984375000
+531it [01:09,  7.66it/s]
+P(y|x) 57:40600 loss=   0.018736161, acc=   1.000000000
+631it [01:22,  7.71it/s]
+P(y|x) 57:40700 loss=   0.293594569, acc=   0.953125000
+703it [01:32,  7.63it/s]
+Epoch 57: Train Loss 0.058018993586301804, Train Acc 0.9801075458526611
+Epoch 57: Test Loss 0.3829438388347626, Test Acc 0.9059000015258789
+Epoch 57: Valid Loss 0.40291523933410645, Valid Acc 0.902999997138977
+28it [00:03,  7.61it/s]
+P(y|x) 58:40800 loss=   0.005693257, acc=   1.000000000
+128it [00:17,  7.60it/s]
+P(y|x) 58:40900 loss=   0.033007178, acc=   1.000000000
+228it [00:30,  7.62it/s]
+P(y|x) 58:41000 loss=   0.043017074, acc=   0.984375000
+328it [00:43,  7.64it/s]
+P(y|x) 58:41100 loss=   0.091459893, acc=   0.968750000
+428it [00:56,  7.68it/s]
+P(y|x) 58:41200 loss=   0.052171923, acc=   1.000000000
+528it [01:09,  7.65it/s]
+P(y|x) 58:41300 loss=   0.006234184, acc=   1.000000000
+628it [01:22,  7.68it/s]
+P(y|x) 58:41400 loss=   0.172757775, acc=   0.968750000
+703it [01:32,  7.63it/s]
+Epoch 58: Train Loss 0.05567200109362602, Train Acc 0.9810188412666321
+Epoch 58: Test Loss 0.3639638125896454, Test Acc 0.9136000275611877
+Epoch 58: Valid Loss 0.3765159547328949, Valid Acc 0.9115999937057495
+25it [00:03,  7.66it/s]
+P(y|x) 59:41500 loss=   0.008533604, acc=   1.000000000
+125it [00:16,  7.67it/s]
+P(y|x) 59:41600 loss=   0.088628970, acc=   0.984375000
+225it [00:29,  7.64it/s]
+P(y|x) 59:41700 loss=   0.102759786, acc=   0.968750000
+325it [00:42,  7.62it/s]
+P(y|x) 59:41800 loss=   0.020619854, acc=   0.984375000
+425it [00:55,  7.65it/s]
+P(y|x) 59:41900 loss=   0.050732873, acc=   0.984375000
+525it [01:08,  7.64it/s]
+P(y|x) 59:42000 loss=   0.089691602, acc=   0.968750000
+625it [01:21,  7.65it/s]
+P(y|x) 59:42100 loss=   0.064161249, acc=   0.968750000
+703it [01:32,  7.62it/s]
+Epoch 59: Train Loss 0.06426779180765152, Train Acc 0.9778849482536316
+Epoch 59: Test Loss 0.3786899447441101, Test Acc 0.906499981880188
+Epoch 59: Valid Loss 0.38380950689315796, Valid Acc 0.9046000242233276
+22it [00:03,  7.59it/s]
+P(y|x) 60:42200 loss=   0.107515961, acc=   0.968750000
+122it [00:16,  7.67it/s]
+P(y|x) 60:42300 loss=   0.036068633, acc=   0.984375000
+222it [00:29,  7.64it/s]
+P(y|x) 60:42400 loss=   0.083423026, acc=   0.953125000
+322it [00:42,  7.70it/s]
+P(y|x) 60:42500 loss=   0.105626278, acc=   0.968750000
+422it [00:55,  7.65it/s]
+P(y|x) 60:42600 loss=   0.123889990, acc=   0.953125000
+522it [01:08,  7.66it/s]
+P(y|x) 60:42700 loss=   0.082010671, acc=   0.984375000
+622it [01:21,  7.65it/s]
+P(y|x) 60:42800 loss=   0.040578946, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 60: Train Loss 0.0820714458823204, Train Acc 0.9722617268562317
+Epoch 60: Test Loss 0.44656455516815186, Test Acc 0.9035000205039978
+Epoch 60: Valid Loss 0.4714784622192383, Valid Acc 0.9070000052452087
+19it [00:02,  7.67it/s]
+P(y|x) 61:42900 loss=   0.009026237, acc=   1.000000000
+119it [00:15,  7.65it/s]
+P(y|x) 61:43000 loss=   0.117625326, acc=   0.937500000
+219it [00:28,  7.64it/s]
+P(y|x) 61:43100 loss=   0.008843340, acc=   1.000000000
+319it [00:41,  7.65it/s]
+P(y|x) 61:43200 loss=   0.006936550, acc=   1.000000000
+419it [00:54,  7.63it/s]
+P(y|x) 61:43300 loss=   0.113496490, acc=   0.968750000
+519it [01:08,  7.64it/s]
+P(y|x) 61:43400 loss=   0.112150259, acc=   0.984375000
+619it [01:21,  7.66it/s]
+P(y|x) 61:43500 loss=   0.178035840, acc=   0.953125000
+703it [01:32,  7.64it/s]
+Epoch 61: Train Loss 0.058507055044174194, Train Acc 0.9799075126647949
+Epoch 61: Test Loss 0.41371703147888184, Test Acc 0.9090999960899353
+Epoch 61: Valid Loss 0.4198710024356842, Valid Acc 0.9100000262260437
+16it [00:02,  7.62it/s]
+P(y|x) 62:43600 loss=   0.096163668, acc=   0.984375000
+116it [00:15,  7.61it/s]
+P(y|x) 62:43700 loss=   0.107563145, acc=   0.953125000
+216it [00:28,  7.66it/s]
+P(y|x) 62:43800 loss=   0.132018790, acc=   0.968750000
+316it [00:41,  7.66it/s]
+P(y|x) 62:43900 loss=   0.062244475, acc=   0.984375000
+416it [00:54,  7.65it/s]
+P(y|x) 62:44000 loss=   0.005943209, acc=   1.000000000
+516it [01:07,  7.66it/s]
+P(y|x) 62:44100 loss=   0.054324545, acc=   0.968750000
+616it [01:20,  7.66it/s]
+P(y|x) 62:44200 loss=   0.173338264, acc=   0.953125000
+703it [01:32,  7.62it/s]
+Epoch 62: Train Loss 0.07622349262237549, Train Acc 0.9752178192138672
+Epoch 62: Test Loss 0.4185473620891571, Test Acc 0.9018999934196472
+Epoch 62: Valid Loss 0.42924726009368896, Valid Acc 0.9021999835968018
+13it [00:01,  7.61it/s]
+P(y|x) 63:44300 loss=   0.123414829, acc=   0.968750000
+113it [00:14,  7.69it/s]
+P(y|x) 63:44400 loss=   0.021007553, acc=   0.984375000
+213it [00:27,  7.69it/s]
+P(y|x) 63:44500 loss=   0.122793116, acc=   0.968750000
+313it [00:40,  7.70it/s]
+P(y|x) 63:44600 loss=   0.123456433, acc=   0.937500000
+413it [00:53,  7.71it/s]
+P(y|x) 63:44700 loss=   0.077685110, acc=   0.968750000
+513it [01:06,  7.72it/s]
+P(y|x) 63:44800 loss=   0.197263509, acc=   0.937500000
+613it [01:19,  7.73it/s]
+P(y|x) 63:44900 loss=   0.175365388, acc=   0.953125000
+703it [01:31,  7.67it/s]
+Epoch 63: Train Loss 0.08666252344846725, Train Acc 0.9701946973800659
+Epoch 63: Test Loss 0.44077739119529724, Test Acc 0.8952000141143799
+Epoch 63: Valid Loss 0.459213525056839, Valid Acc 0.9034000039100647
+10it [00:01,  7.51it/s]
+P(y|x) 64:45000 loss=   0.064886548, acc=   0.984375000
+110it [00:14,  7.63it/s]
+P(y|x) 64:45100 loss=   0.080397420, acc=   0.968750000
+210it [00:27,  7.64it/s]
+P(y|x) 64:45200 loss=   0.035762370, acc=   0.984375000
+310it [00:40,  7.66it/s]
+P(y|x) 64:45300 loss=   0.008295015, acc=   1.000000000
+410it [00:53,  7.65it/s]
+P(y|x) 64:45400 loss=   0.021395102, acc=   1.000000000
+510it [01:06,  7.64it/s]
+P(y|x) 64:45500 loss=   0.024408199, acc=   0.984375000
+610it [01:20,  7.64it/s]
+P(y|x) 64:45600 loss=   0.055131517, acc=   0.968750000
+703it [01:32,  7.62it/s]
+Epoch 64: Train Loss 0.04446297883987427, Train Acc 0.9851306676864624
+Epoch 64: Test Loss 0.3803647756576538, Test Acc 0.9158999919891357
+Epoch 64: Valid Loss 0.4031045734882355, Valid Acc 0.9110000133514404
+7it [00:01,  7.11it/s]
+P(y|x) 65:45700 loss=   0.016510960, acc=   1.000000000
+107it [00:14,  7.66it/s]
+P(y|x) 65:45800 loss=   0.092637539, acc=   0.953125000
+207it [00:27,  7.70it/s]
+P(y|x) 65:45900 loss=   0.024763368, acc=   1.000000000
+307it [00:40,  7.62it/s]
+P(y|x) 65:46000 loss=   0.076981373, acc=   0.984375000
+407it [00:53,  7.51it/s]
+P(y|x) 65:46100 loss=   0.080653705, acc=   0.968750000
+507it [01:06,  7.58it/s]
+P(y|x) 65:46200 loss=   0.184476316, acc=   0.937500000
+607it [01:19,  7.58it/s]
+P(y|x) 65:46300 loss=   0.151439577, acc=   0.937500000
+703it [01:32,  7.62it/s]
+Epoch 65: Train Loss 0.05657089129090309, Train Acc 0.980929970741272
+Epoch 65: Test Loss 0.3953206539154053, Test Acc 0.9079999923706055
+Epoch 65: Valid Loss 0.40127432346343994, Valid Acc 0.9075999855995178
+4it [00:00,  5.90it/s]
+P(y|x) 66:46400 loss=   0.055799749, acc=   0.984375000
+104it [00:13,  7.55it/s]
+P(y|x) 66:46500 loss=   0.042539626, acc=   0.984375000
+204it [00:27,  7.66it/s]
+P(y|x) 66:46600 loss=   0.119701259, acc=   0.921875000
+304it [00:40,  7.65it/s]
+P(y|x) 66:46700 loss=   0.005955994, acc=   1.000000000
+404it [00:53,  7.65it/s]
+P(y|x) 66:46800 loss=   0.134930044, acc=   0.937500000
+504it [01:06,  7.68it/s]
+P(y|x) 66:46900 loss=   0.149122477, acc=   0.937500000
+604it [01:19,  7.68it/s]
+P(y|x) 66:47000 loss=   0.269232154, acc=   0.921875000
+703it [01:32,  7.64it/s]
+P(y|x) 66:47100 loss=   0.089256354, acc=   0.984375000
+
+Epoch 66: Train Loss 0.06655563414096832, Train Acc 0.9766847491264343
+Epoch 66: Test Loss 0.3837870657444, Test Acc 0.9016000032424927
+Epoch 66: Valid Loss 0.39388585090637207, Valid Acc 0.9061999917030334
+101it [00:13,  7.63it/s]
+P(y|x) 67:47200 loss=   0.026027329, acc=   0.984375000
+201it [00:26,  7.68it/s]
+P(y|x) 67:47300 loss=   0.038379047, acc=   0.984375000
+301it [00:39,  7.67it/s]
+P(y|x) 67:47400 loss=   0.025653973, acc=   1.000000000
+401it [00:52,  7.64it/s]
+P(y|x) 67:47500 loss=   0.002270758, acc=   1.000000000
+501it [01:05,  7.64it/s]
+P(y|x) 67:47600 loss=   0.039400980, acc=   0.984375000
+601it [01:18,  7.67it/s]
+P(y|x) 67:47700 loss=   0.066919647, acc=   0.953125000
+701it [01:31,  7.68it/s]
+P(y|x) 67:47800 loss=   0.039663330, acc=   0.984375000
+703it [01:32,  7.64it/s]
+Epoch 67: Train Loss 0.06173674017190933, Train Acc 0.9782405495643616
+Epoch 67: Test Loss 0.4227912127971649, Test Acc 0.9061999917030334
+Epoch 67: Valid Loss 0.42266905307769775, Valid Acc 0.907800018787384
+98it [00:13,  7.62it/s]
+P(y|x) 68:47900 loss=   0.089398362, acc=   0.968750000
+198it [00:26,  7.67it/s]
+P(y|x) 68:48000 loss=   0.025079302, acc=   1.000000000
+298it [00:39,  7.67it/s]
+P(y|x) 68:48100 loss=   0.123862050, acc=   0.953125000
+398it [00:52,  7.70it/s]
+P(y|x) 68:48200 loss=   0.094422534, acc=   0.968750000
+498it [01:05,  7.66it/s]
+P(y|x) 68:48300 loss=   0.008375019, acc=   1.000000000
+598it [01:18,  7.67it/s]
+P(y|x) 68:48400 loss=   0.042089254, acc=   0.984375000
+698it [01:31,  7.66it/s]
+P(y|x) 68:48500 loss=   0.144521683, acc=   0.953125000
+703it [01:31,  7.65it/s]
+Epoch 68: Train Loss 0.05983152613043785, Train Acc 0.979196310043335
+Epoch 68: Test Loss 0.4117814898490906, Test Acc 0.909600019454956
+Epoch 68: Valid Loss 0.46120673418045044, Valid Acc 0.9031999707221985
+95it [00:12,  7.67it/s]
+P(y|x) 69:48600 loss=   0.005941093, acc=   1.000000000
+195it [00:25,  7.63it/s]
+P(y|x) 69:48700 loss=   0.017491683, acc=   0.984375000
+295it [00:38,  7.65it/s]
+P(y|x) 69:48800 loss=   0.069328807, acc=   0.968750000
+395it [00:51,  7.64it/s]
+P(y|x) 69:48900 loss=   0.192254692, acc=   0.937500000
+495it [01:05,  7.64it/s]
+P(y|x) 69:49000 loss=   0.036893025, acc=   0.984375000
+595it [01:18,  7.66it/s]
+P(y|x) 69:49100 loss=   0.008140139, acc=   1.000000000
+695it [01:31,  7.67it/s]
+P(y|x) 69:49200 loss=   0.061433986, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 69: Train Loss 0.07218107581138611, Train Acc 0.9756178855895996
+Epoch 69: Test Loss 0.4302952289581299, Test Acc 0.8999000191688538
+Epoch 69: Valid Loss 0.43906307220458984, Valid Acc 0.8962000012397766
+92it [00:12,  7.66it/s]
+P(y|x) 70:49300 loss=   0.047603175, acc=   0.984375000
+192it [00:25,  7.66it/s]
+P(y|x) 70:49400 loss=   0.024667867, acc=   0.984375000
+292it [00:38,  7.67it/s]
+P(y|x) 70:49500 loss=   0.028314739, acc=   0.984375000
+392it [00:51,  7.67it/s]
+P(y|x) 70:49600 loss=   0.020119980, acc=   1.000000000
+492it [01:04,  7.67it/s]
+P(y|x) 70:49700 loss=   0.064681262, acc=   0.953125000
+592it [01:17,  7.69it/s]
+P(y|x) 70:49800 loss=   0.080484778, acc=   0.968750000
+692it [01:30,  7.69it/s]
+P(y|x) 70:49900 loss=   0.088675007, acc=   0.984375000
+703it [01:32,  7.64it/s]
+Epoch 70: Train Loss 0.07311677932739258, Train Acc 0.9751733541488647
+Epoch 70: Test Loss 0.4475391209125519, Test Acc 0.9034000039100647
+Epoch 70: Valid Loss 0.4326724708080292, Valid Acc 0.9039999842643738
+89it [00:11,  7.67it/s]
+P(y|x) 71:50000 loss=   0.036920831, acc=   0.984375000
+189it [00:24,  7.62it/s]
+P(y|x) 71:50100 loss=   0.055421513, acc=   0.968750000
+289it [00:38,  7.65it/s]
+P(y|x) 71:50200 loss=   0.077735581, acc=   0.984375000
+389it [00:51,  7.65it/s]
+P(y|x) 71:50300 loss=   0.014024928, acc=   1.000000000
+489it [01:04,  7.65it/s]
+P(y|x) 71:50400 loss=   0.139755219, acc=   0.937500000
+589it [01:17,  7.69it/s]
+P(y|x) 71:50500 loss=   0.200802132, acc=   0.937500000
+689it [01:30,  7.69it/s]
+P(y|x) 71:50600 loss=   0.139803529, acc=   0.968750000
+703it [01:32,  7.62it/s]
+Epoch 71: Train Loss 0.05568859353661537, Train Acc 0.9802854061126709
+Epoch 71: Test Loss 0.42559629678726196, Test Acc 0.911300003528595
+Epoch 71: Valid Loss 0.45424795150756836, Valid Acc 0.9061999917030334
+86it [00:11,  7.62it/s]
+P(y|x) 72:50700 loss=   0.011111133, acc=   1.000000000
+186it [00:24,  7.66it/s]
+P(y|x) 72:50800 loss=   0.203089818, acc=   0.984375000
+286it [00:37,  7.64it/s]
+P(y|x) 72:50900 loss=   0.039954267, acc=   0.984375000
+386it [00:50,  7.66it/s]
+P(y|x) 72:51000 loss=   0.052542977, acc=   0.984375000
+486it [01:04,  7.67it/s]
+P(y|x) 72:51100 loss=   0.043799490, acc=   0.968750000
+586it [01:17,  7.62it/s]
+P(y|x) 72:51200 loss=   0.103781663, acc=   0.968750000
+686it [01:30,  7.64it/s]
+P(y|x) 72:51300 loss=   0.014853023, acc=   1.000000000
+703it [01:32,  7.60it/s]
+Epoch 72: Train Loss 0.04515741392970085, Train Acc 0.984197199344635
+Epoch 72: Test Loss 0.3768344223499298, Test Acc 0.9114999771118164
+Epoch 72: Valid Loss 0.39363569021224976, Valid Acc 0.9106000065803528
+83it [00:11,  7.55it/s]
+P(y|x) 73:51400 loss=   0.068641290, acc=   0.968750000
+183it [00:24,  7.59it/s]
+P(y|x) 73:51500 loss=   0.038931921, acc=   0.984375000
+283it [00:37,  7.60it/s]
+P(y|x) 73:51600 loss=   0.026226901, acc=   1.000000000
+383it [00:50,  7.68it/s]
+P(y|x) 73:51700 loss=   0.103714190, acc=   0.968750000
+483it [01:03,  7.66it/s]
+P(y|x) 73:51800 loss=   0.011252105, acc=   1.000000000
+583it [01:16,  7.66it/s]
+P(y|x) 73:51900 loss=   0.125223473, acc=   0.953125000
+683it [01:29,  7.65it/s]
+P(y|x) 73:52000 loss=   0.085599229, acc=   0.968750000
+703it [01:32,  7.60it/s]
+Epoch 73: Train Loss 0.05324886366724968, Train Acc 0.9814189076423645
+Epoch 73: Test Loss 0.3940265476703644, Test Acc 0.9101999998092651
+Epoch 73: Valid Loss 0.3916071355342865, Valid Acc 0.9118000268936157
+80it [00:10,  7.66it/s]
+P(y|x) 74:52100 loss=   0.041567609, acc=   0.984375000
+180it [00:23,  7.63it/s]
+P(y|x) 74:52200 loss=   0.016966879, acc=   1.000000000
+280it [00:36,  7.67it/s]
+P(y|x) 74:52300 loss=   0.075179115, acc=   0.984375000
+380it [00:49,  7.68it/s]
+P(y|x) 74:52400 loss=   0.062052995, acc=   0.984375000
+480it [01:02,  7.68it/s]
+P(y|x) 74:52500 loss=   0.019982703, acc=   0.984375000
+580it [01:16,  7.67it/s]
+P(y|x) 74:52600 loss=   0.036377333, acc=   0.984375000
+680it [01:29,  7.67it/s]
+P(y|x) 74:52700 loss=   0.035341009, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 74: Train Loss 0.06676884740591049, Train Acc 0.9777071475982666
+Epoch 74: Test Loss 0.4382394552230835, Test Acc 0.9045000076293945
+Epoch 74: Valid Loss 0.4301968812942505, Valid Acc 0.9061999917030334
+77it [00:10,  7.56it/s]
+P(y|x) 75:52800 loss=   0.004934937, acc=   1.000000000
+177it [00:23,  7.60it/s]
+P(y|x) 75:52900 loss=   0.149683267, acc=   0.968750000
+277it [00:36,  7.60it/s]
+P(y|x) 75:53000 loss=   0.029560268, acc=   0.984375000
+377it [00:49,  7.63it/s]
+P(y|x) 75:53100 loss=   0.041018270, acc=   0.984375000
+477it [01:02,  7.72it/s]
+P(y|x) 75:53200 loss=   0.041147232, acc=   0.984375000
+577it [01:15,  7.68it/s]
+P(y|x) 75:53300 loss=   0.023449942, acc=   0.984375000
+677it [01:29,  7.65it/s]
+P(y|x) 75:53400 loss=   0.098193817, acc=   0.968750000
+703it [01:32,  7.60it/s]
+Epoch 75: Train Loss 0.05274398997426033, Train Acc 0.9817301034927368
+Epoch 75: Test Loss 0.4282442033290863, Test Acc 0.9089999794960022
+Epoch 75: Valid Loss 0.419111967086792, Valid Acc 0.9154000282287598
+74it [00:09,  7.62it/s]
+P(y|x) 76:53500 loss=   0.012312397, acc=   1.000000000
+174it [00:23,  7.63it/s]
+P(y|x) 76:53600 loss=   0.186350867, acc=   0.953125000
+274it [00:36,  7.62it/s]
+P(y|x) 76:53700 loss=   0.118197702, acc=   0.953125000
+374it [00:49,  7.62it/s]
+P(y|x) 76:53800 loss=   0.013754345, acc=   1.000000000
+474it [01:02,  7.58it/s]
+P(y|x) 76:53900 loss=   0.154038906, acc=   0.953125000
+574it [01:15,  7.66it/s]
+P(y|x) 76:54000 loss=   0.067394748, acc=   0.968750000
+674it [01:28,  7.59it/s]
+P(y|x) 76:54100 loss=   0.067480668, acc=   0.968750000
+703it [01:32,  7.63it/s]
+Epoch 76: Train Loss 0.06818113476037979, Train Acc 0.977573812007904
+Epoch 76: Test Loss 0.434207558631897, Test Acc 0.9054999947547913
+Epoch 76: Valid Loss 0.45693302154541016, Valid Acc 0.9052000045776367
+71it [00:09,  7.64it/s]
+P(y|x) 77:54200 loss=   0.010626584, acc=   1.000000000
+171it [00:22,  7.71it/s]
+P(y|x) 77:54300 loss=   0.076816499, acc=   0.968750000
+271it [00:35,  7.63it/s]
+P(y|x) 77:54400 loss=   0.068271033, acc=   0.953125000
+371it [00:48,  7.67it/s]
+P(y|x) 77:54500 loss=   0.014508188, acc=   1.000000000
+471it [01:01,  7.67it/s]
+P(y|x) 77:54600 loss=   0.024992794, acc=   1.000000000
+571it [01:14,  7.69it/s]
+P(y|x) 77:54700 loss=   0.038537070, acc=   0.984375000
+671it [01:27,  7.67it/s]
+P(y|x) 77:54800 loss=   0.031725854, acc=   0.984375000
+703it [01:32,  7.64it/s]
+Epoch 77: Train Loss 0.07697445899248123, Train Acc 0.9745732545852661
+Epoch 77: Test Loss 0.45402997732162476, Test Acc 0.9013000130653381
+Epoch 77: Valid Loss 0.4506007730960846, Valid Acc 0.8996000289916992
+68it [00:09,  7.66it/s]
+P(y|x) 78:54900 loss=   0.043730676, acc=   0.968750000
+168it [00:22,  7.68it/s]
+P(y|x) 78:55000 loss=   0.070667744, acc=   0.968750000
+268it [00:35,  7.69it/s]
+P(y|x) 78:55100 loss=   0.065099582, acc=   0.968750000
+368it [00:48,  7.64it/s]
+P(y|x) 78:55200 loss=   0.096182972, acc=   0.953125000
+468it [01:01,  7.65it/s]
+P(y|x) 78:55300 loss=   0.136144802, acc=   0.937500000
+568it [01:14,  7.68it/s]
+P(y|x) 78:55400 loss=   0.051010862, acc=   0.984375000
+668it [01:27,  7.67it/s]
+P(y|x) 78:55500 loss=   0.122675516, acc=   0.968750000
+703it [01:31,  7.65it/s]
+Epoch 78: Train Loss 0.05307592451572418, Train Acc 0.9818856716156006
+Epoch 78: Test Loss 0.4054572880268097, Test Acc 0.9110999703407288
+Epoch 78: Valid Loss 0.44583243131637573, Valid Acc 0.9052000045776367
+65it [00:08,  7.65it/s]
+P(y|x) 79:55600 loss=   0.045220800, acc=   0.984375000
+165it [00:21,  7.68it/s]
+P(y|x) 79:55700 loss=   0.026227020, acc=   0.984375000
+265it [00:34,  7.62it/s]
+P(y|x) 79:55800 loss=   0.070094571, acc=   0.984375000
+365it [00:47,  7.62it/s]
+P(y|x) 79:55900 loss=   0.114071235, acc=   0.984375000
+465it [01:01,  7.66it/s]
+P(y|x) 79:56000 loss=   0.095899396, acc=   0.953125000
+565it [01:14,  7.63it/s]
+P(y|x) 79:56100 loss=   0.134183154, acc=   0.968750000
+665it [01:27,  7.61it/s]
+P(y|x) 79:56200 loss=   0.010413997, acc=   1.000000000
+703it [01:32,  7.62it/s]
+Epoch 79: Train Loss 0.08239047229290009, Train Acc 0.9728840589523315
+Epoch 79: Test Loss 0.45881593227386475, Test Acc 0.9010999798774719
+Epoch 79: Valid Loss 0.43899375200271606, Valid Acc 0.9047999978065491
+62it [00:08,  7.64it/s]
+P(y|x) 80:56300 loss=   0.013354458, acc=   1.000000000
+162it [00:21,  7.59it/s]
+P(y|x) 80:56400 loss=   0.000334501, acc=   1.000000000
+262it [00:34,  7.59it/s]
+P(y|x) 80:56500 loss=   0.084813684, acc=   0.968750000
+362it [00:47,  7.62it/s]
+P(y|x) 80:56600 loss=   0.073536076, acc=   0.968750000
+462it [01:00,  7.65it/s]
+P(y|x) 80:56700 loss=   0.069622412, acc=   0.968750000
+562it [01:14,  7.60it/s]
+P(y|x) 80:56800 loss=   0.044151284, acc=   0.984375000
+662it [01:27,  7.62it/s]
+P(y|x) 80:56900 loss=   0.111013263, acc=   0.984375000
+703it [01:32,  7.58it/s]
+Epoch 80: Train Loss 0.057526588439941406, Train Acc 0.9803076386451721
+Epoch 80: Test Loss 0.4123891592025757, Test Acc 0.9057999849319458
+Epoch 80: Valid Loss 0.4342399537563324, Valid Acc 0.9061999917030334
+59it [00:07,  7.65it/s]
+P(y|x) 81:57000 loss=   0.030719906, acc=   0.984375000
+159it [00:21,  7.61it/s]
+P(y|x) 81:57100 loss=   0.007494889, acc=   1.000000000
+259it [00:34,  7.59it/s]
+P(y|x) 81:57200 loss=   0.085654728, acc=   0.968750000
+359it [00:47,  7.62it/s]
+P(y|x) 81:57300 loss=   0.085018024, acc=   0.953125000
+459it [01:00,  7.59it/s]
+P(y|x) 81:57400 loss=   0.023874931, acc=   1.000000000
+559it [01:13,  7.62it/s]
+P(y|x) 81:57500 loss=   0.001694426, acc=   1.000000000
+659it [01:26,  7.54it/s]
+P(y|x) 81:57600 loss=   0.090951309, acc=   0.953125000
+703it [01:32,  7.59it/s]
+Epoch 81: Train Loss 0.05753238499164581, Train Acc 0.980729877948761
+Epoch 81: Test Loss 0.41950854659080505, Test Acc 0.9100000262260437
+Epoch 81: Valid Loss 0.4230746030807495, Valid Acc 0.9056000113487244
+56it [00:07,  7.57it/s]
+P(y|x) 82:57700 loss=   0.078453340, acc=   0.968750000
+156it [00:20,  7.65it/s]
+P(y|x) 82:57800 loss=   0.030140355, acc=   0.984375000
+256it [00:33,  7.67it/s]
+P(y|x) 82:57900 loss=   0.130178094, acc=   0.968750000
+356it [00:46,  7.63it/s]
+P(y|x) 82:58000 loss=   0.042808376, acc=   0.984375000
+456it [00:59,  7.67it/s]
+P(y|x) 82:58100 loss=   0.216013953, acc=   0.953125000
+556it [01:13,  7.63it/s]
+P(y|x) 82:58200 loss=   0.114319399, acc=   0.968750000
+656it [01:26,  7.58it/s]
+P(y|x) 82:58300 loss=   0.075500138, acc=   0.984375000
+703it [01:32,  7.61it/s]
+Epoch 82: Train Loss 0.05512628331780434, Train Acc 0.9808188080787659
+Epoch 82: Test Loss 0.44739681482315063, Test Acc 0.9085999727249146
+Epoch 82: Valid Loss 0.462920218706131, Valid Acc 0.9049999713897705
+53it [00:07,  7.62it/s]
+P(y|x) 83:58400 loss=   0.005249888, acc=   1.000000000
+153it [00:20,  7.65it/s]
+P(y|x) 83:58500 loss=   0.160055429, acc=   0.953125000
+253it [00:33,  7.71it/s]
+P(y|x) 83:58600 loss=   0.026710361, acc=   1.000000000
+353it [00:46,  7.72it/s]
+P(y|x) 83:58700 loss=   0.055517040, acc=   0.968750000
+453it [00:59,  7.68it/s]
+P(y|x) 83:58800 loss=   0.137726292, acc=   0.968750000
+553it [01:12,  7.71it/s]
+P(y|x) 83:58900 loss=   0.022910483, acc=   0.984375000
+653it [01:25,  7.68it/s]
+P(y|x) 83:59000 loss=   0.056379598, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 83: Train Loss 0.046407293528318405, Train Acc 0.9845083355903625
+Epoch 83: Test Loss 0.42577895522117615, Test Acc 0.9093999862670898
+Epoch 83: Valid Loss 0.45422911643981934, Valid Acc 0.9047999978065491
+50it [00:06,  7.59it/s]
+P(y|x) 84:59100 loss=   0.022126362, acc=   1.000000000
+150it [00:19,  7.65it/s]
+P(y|x) 84:59200 loss=   0.074132383, acc=   0.984375000
+250it [00:32,  7.63it/s]
+P(y|x) 84:59300 loss=   0.122080214, acc=   0.953125000
+350it [00:45,  7.63it/s]
+P(y|x) 84:59400 loss=   0.056699313, acc=   0.984375000
+450it [00:58,  7.65it/s]
+P(y|x) 84:59500 loss=   0.019750215, acc=   0.984375000
+550it [01:11,  7.63it/s]
+P(y|x) 84:59600 loss=   0.018748261, acc=   1.000000000
+650it [01:24,  7.64it/s]
+P(y|x) 84:59700 loss=   0.025135390, acc=   1.000000000
+703it [01:31,  7.66it/s]
+Epoch 84: Train Loss 0.06905394792556763, Train Acc 0.9765514135360718
+Epoch 84: Test Loss 0.41390323638916016, Test Acc 0.9039999842643738
+Epoch 84: Valid Loss 0.41937559843063354, Valid Acc 0.9025999903678894
+47it [00:06,  7.56it/s]
+P(y|x) 85:59800 loss=   0.033481434, acc=   0.968750000
+147it [00:19,  7.67it/s]
+P(y|x) 85:59900 loss=   0.070343792, acc=   0.984375000
+247it [00:32,  7.65it/s]
+P(y|x) 85:60000 loss=   0.041805014, acc=   0.984375000
+347it [00:45,  7.68it/s]
+P(y|x) 85:60100 loss=   0.055600204, acc=   0.984375000
+447it [00:58,  7.66it/s]
+P(y|x) 85:60200 loss=   0.028544553, acc=   0.984375000
+547it [01:11,  7.68it/s]
+P(y|x) 85:60300 loss=   0.087482832, acc=   0.937500000
+647it [01:24,  7.68it/s]
+P(y|x) 85:60400 loss=   0.061137959, acc=   0.968750000
+703it [01:31,  7.65it/s]
+Epoch 85: Train Loss 0.05642024055123329, Train Acc 0.9809743762016296
+Epoch 85: Test Loss 0.4362293481826782, Test Acc 0.9079999923706055
+Epoch 85: Valid Loss 0.4856082499027252, Valid Acc 0.901199996471405
+44it [00:06,  7.63it/s]
+P(y|x) 86:60500 loss=   0.014053136, acc=   1.000000000
+144it [00:19,  7.65it/s]
+P(y|x) 86:60600 loss=   0.089594394, acc=   0.953125000
+244it [00:32,  7.73it/s]
+P(y|x) 86:60700 loss=   0.024012811, acc=   0.984375000
+344it [00:45,  7.68it/s]
+P(y|x) 86:60800 loss=   0.026833251, acc=   0.984375000
+444it [00:58,  7.59it/s]
+P(y|x) 86:60900 loss=   0.002929404, acc=   1.000000000
+544it [01:11,  7.59it/s]
+P(y|x) 86:61000 loss=   0.094634831, acc=   0.968750000
+644it [01:24,  7.59it/s]
+P(y|x) 86:61100 loss=   0.198946044, acc=   0.953125000
+703it [01:32,  7.61it/s]
+Epoch 86: Train Loss 0.04650624468922615, Train Acc 0.9846417307853699
+Epoch 86: Test Loss 0.41564276814460754, Test Acc 0.9083999991416931
+Epoch 86: Valid Loss 0.42883729934692383, Valid Acc 0.9052000045776367
+41it [00:05,  7.60it/s]
+P(y|x) 87:61200 loss=   0.128295034, acc=   0.968750000
+141it [00:18,  7.59it/s]
+P(y|x) 87:61300 loss=   0.064336121, acc=   0.968750000
+241it [00:31,  7.65it/s]
+P(y|x) 87:61400 loss=   0.011528008, acc=   1.000000000
+341it [00:45,  7.61it/s]
+P(y|x) 87:61500 loss=   0.149806172, acc=   0.968750000
+441it [00:58,  7.68it/s]
+P(y|x) 87:61600 loss=   0.011207491, acc=   1.000000000
+541it [01:11,  7.73it/s]
+P(y|x) 87:61700 loss=   0.037098050, acc=   0.984375000
+641it [01:24,  7.73it/s]
+P(y|x) 87:61800 loss=   0.026713729, acc=   0.984375000
+703it [01:32,  7.61it/s]
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Epoch 87: Train Loss 0.05753043666481972, Train Acc 0.9809743762016296
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Epoch 87: Test Loss 0.4121125340461731, Test Acc 0.9061999917030334
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    self._shutdown_workers()
+    w.join()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    w.join()
+AssertionError: can only join a child process
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+    self._shutdown_workers()
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    w.join()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    self._shutdown_workers()
+    self._shutdown_workers()
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+AssertionError: can only join a child process
+    w.join()
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+    w.join()
+Traceback (most recent call last):
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    self._shutdown_workers()
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+Epoch 87: Valid Loss 0.41914522647857666, Valid Acc 0.9031999707221985
+0it [00:00, ?it/s]Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+    self._shutdown_workers()
+    self._shutdown_workers()
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+    w.join()
+    w.join()
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    self._shutdown_workers()
+    w.join()
+    w.join()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    w.join()
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Traceback (most recent call last):
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+    w.join()
+Traceback (most recent call last):
+Traceback (most recent call last):
+    self._shutdown_workers()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+    self._shutdown_workers()
+    w.join()
+    self._shutdown_workers()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    w.join()
+    w.join()
+AssertionError: can only join a child process
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+AssertionError: can only join a child process
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+Traceback (most recent call last):
+    w.join()
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    w.join()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    self._shutdown_workers()
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+AssertionError: can only join a child process
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+AssertionError: can only join a child process
+38it [00:05,  7.64it/s]
+P(y|x) 88:61900 loss=   0.004789084, acc=   1.000000000
+138it [00:18,  7.62it/s]
+P(y|x) 88:62000 loss=   0.056369662, acc=   0.984375000
+238it [00:31,  7.63it/s]
+P(y|x) 88:62100 loss=   0.269860268, acc=   0.921875000
+338it [00:44,  7.67it/s]
+P(y|x) 88:62200 loss=   0.174533159, acc=   0.953125000
+438it [00:57,  7.64it/s]
+P(y|x) 88:62300 loss=   0.064922437, acc=   0.968750000
+538it [01:10,  7.65it/s]
+P(y|x) 88:62400 loss=   0.250142515, acc=   0.953125000
+638it [01:23,  7.66it/s]
+P(y|x) 88:62500 loss=   0.070054524, acc=   0.968750000
+703it [01:32,  7.60it/s]
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+    w.join()
+AssertionError: can only join a child process
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+Traceback (most recent call last):
+AssertionError: can only join a child process
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9acf92a828>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Exception ignored in: <bound method _MultiProcessingDataLoaderIter.__del__ of <torch.utils.data.dataloader._MultiProcessingDataLoaderIter object at 0x2b9ace9742b0>>
+Traceback (most recent call last):
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 961, in __del__
+    self._shutdown_workers()
+  File "/usr/local/lib64/python3.6/site-packages/torch/utils/data/dataloader.py", line 941, in _shutdown_workers
+    w.join()
+  File "/usr/lib64/python3.6/multiprocessing/process.py", line 122, in join
+    assert self._parent_pid == os.getpid(), 'can only join a child process'
+AssertionError: can only join a child process
+Epoch 88: Train Loss 0.04785362631082535, Train Acc 0.9836193323135376
+Epoch 88: Test Loss 0.4270622134208679, Test Acc 0.9089000225067139
+Epoch 88: Valid Loss 0.4441834092140198, Valid Acc 0.907800018787384
+35it [00:04,  7.63it/s]
+P(y|x) 89:62600 loss=   0.074988723, acc=   0.984375000
+135it [00:17,  7.65it/s]
+P(y|x) 89:62700 loss=   0.062867641, acc=   0.984375000
+235it [00:31,  7.66it/s]
+P(y|x) 89:62800 loss=   0.025380336, acc=   0.984375000
+335it [00:44,  7.68it/s]
+P(y|x) 89:62900 loss=   0.049562193, acc=   0.968750000
+435it [00:57,  7.68it/s]
+P(y|x) 89:63000 loss=   0.002477586, acc=   1.000000000
+535it [01:10,  7.64it/s]
+P(y|x) 89:63100 loss=   0.148047060, acc=   0.968750000
+635it [01:23,  7.67it/s]
+P(y|x) 89:63200 loss=   0.197357759, acc=   0.968750000
+703it [01:32,  7.64it/s]
+Epoch 89: Train Loss 0.0676473006606102, Train Acc 0.9770403504371643
+Epoch 89: Test Loss 0.4453553855419159, Test Acc 0.9072999954223633
+Epoch 89: Valid Loss 0.47203436493873596, Valid Acc 0.9074000120162964
+32it [00:04,  7.60it/s]
+P(y|x) 90:63300 loss=   0.003363267, acc=   1.000000000
+132it [00:17,  7.67it/s]
+P(y|x) 90:63400 loss=   0.028462723, acc=   1.000000000
+232it [00:30,  7.62it/s]
+P(y|x) 90:63500 loss=   0.022173397, acc=   1.000000000
+332it [00:43,  7.71it/s]
+P(y|x) 90:63600 loss=   0.135893613, acc=   0.953125000
+432it [00:56,  7.61it/s]
+P(y|x) 90:63700 loss=   0.086879373, acc=   0.968750000
+532it [01:09,  7.74it/s]
+P(y|x) 90:63800 loss=   0.073132657, acc=   0.984375000
+632it [01:22,  7.66it/s]
+P(y|x) 90:63900 loss=   0.110725492, acc=   0.968750000
+703it [01:32,  7.62it/s]
+Epoch 90: Train Loss 0.07292437553405762, Train Acc 0.9753956198692322
+Epoch 90: Test Loss 0.4397521913051605, Test Acc 0.9052000045776367
+Epoch 90: Valid Loss 0.4960857927799225, Valid Acc 0.896399974822998
+29it [00:04,  7.64it/s]
+P(y|x) 91:64000 loss=   0.061669730, acc=   0.984375000
+129it [00:17,  7.58it/s]
+P(y|x) 91:64100 loss=   0.007348061, acc=   1.000000000
+229it [00:30,  7.67it/s]
+P(y|x) 91:64200 loss=   0.013298139, acc=   1.000000000
+329it [00:43,  7.70it/s]
+P(y|x) 91:64300 loss=   0.028514519, acc=   0.968750000
+429it [00:56,  7.70it/s]
+P(y|x) 91:64400 loss=   0.100640491, acc=   0.984375000
+529it [01:09,  7.66it/s]
+P(y|x) 91:64500 loss=   0.003653556, acc=   1.000000000
+629it [01:22,  7.66it/s]
+P(y|x) 91:64600 loss=   0.167490304, acc=   0.984375000
+703it [01:32,  7.64it/s]
+Epoch 91: Train Loss 0.04429741948843002, Train Acc 0.9854418635368347
+Epoch 91: Test Loss 0.4186161756515503, Test Acc 0.9107999801635742
+Epoch 91: Valid Loss 0.4441959857940674, Valid Acc 0.9092000126838684
+26it [00:03,  7.64it/s]
+P(y|x) 92:64700 loss=   0.090890326, acc=   0.968750000
+126it [00:16,  7.61it/s]
+P(y|x) 92:64800 loss=   0.198982388, acc=   0.937500000
+226it [00:29,  7.61it/s]
+P(y|x) 92:64900 loss=   0.013978198, acc=   1.000000000
+326it [00:42,  7.66it/s]
+P(y|x) 92:65000 loss=   0.123074554, acc=   0.968750000
+426it [00:55,  7.66it/s]
+P(y|x) 92:65100 loss=   0.101585127, acc=   0.937500000
+526it [01:08,  7.67it/s]
+P(y|x) 92:65200 loss=   0.005610488, acc=   1.000000000
+626it [01:21,  7.66it/s]
+P(y|x) 92:65300 loss=   0.050944649, acc=   0.984375000
+703it [01:31,  7.65it/s]
+Epoch 92: Train Loss 0.04480072855949402, Train Acc 0.9849750995635986
+Epoch 92: Test Loss 0.4244031608104706, Test Acc 0.9100000262260437
+Epoch 92: Valid Loss 0.4084470570087433, Valid Acc 0.9101999998092651
+23it [00:03,  7.67it/s]
+P(y|x) 93:65400 loss=   0.073482320, acc=   0.984375000
+123it [00:16,  7.62it/s]
+P(y|x) 93:65500 loss=   0.028624132, acc=   0.968750000
+223it [00:29,  7.59it/s]
+P(y|x) 93:65600 loss=   0.015277795, acc=   1.000000000
+323it [00:42,  7.67it/s]
+P(y|x) 93:65700 loss=   0.006329156, acc=   1.000000000
+423it [00:55,  7.67it/s]
+P(y|x) 93:65800 loss=   0.033427954, acc=   0.984375000
+523it [01:08,  7.66it/s]
+P(y|x) 93:65900 loss=   0.038870916, acc=   0.984375000
+623it [01:21,  7.64it/s]
+P(y|x) 93:66000 loss=   0.132851854, acc=   0.906250000
+703it [01:32,  7.63it/s]
+Epoch 93: Train Loss 0.04611651971936226, Train Acc 0.9839749336242676
+Epoch 93: Test Loss 0.4570119082927704, Test Acc 0.9089999794960022
+Epoch 93: Valid Loss 0.45200878381729126, Valid Acc 0.9082000255584717
+20it [00:02,  7.63it/s]
+P(y|x) 94:66100 loss=   0.009815760, acc=   1.000000000
+120it [00:15,  7.67it/s]
+P(y|x) 94:66200 loss=   0.050542861, acc=   0.984375000
+220it [00:28,  7.65it/s]
+P(y|x) 94:66300 loss=   0.123143159, acc=   0.953125000
+320it [00:42,  7.63it/s]
+P(y|x) 94:66400 loss=   0.021974809, acc=   1.000000000
+420it [00:55,  7.61it/s]
+P(y|x) 94:66500 loss=   0.064002380, acc=   0.968750000
+520it [01:08,  7.60it/s]
+P(y|x) 94:66600 loss=   0.018227592, acc=   1.000000000
+620it [01:21,  7.63it/s]
+P(y|x) 94:66700 loss=   0.020780057, acc=   1.000000000
+703it [01:32,  7.60it/s]
+Epoch 94: Train Loss 0.04225832596421242, Train Acc 0.9855974316596985
+Epoch 94: Test Loss 0.41697362065315247, Test Acc 0.9128000140190125
+Epoch 94: Valid Loss 0.46605658531188965, Valid Acc 0.9111999869346619
+17it [00:02,  7.55it/s]
+P(y|x) 95:66800 loss=   0.096952610, acc=   0.984375000
+117it [00:15,  7.59it/s]
+P(y|x) 95:66900 loss=   0.077935219, acc=   0.968750000
+217it [00:28,  7.62it/s]
+P(y|x) 95:67000 loss=   0.114018038, acc=   0.953125000
+317it [00:41,  7.67it/s]
+P(y|x) 95:67100 loss=   0.016853124, acc=   1.000000000
+417it [00:54,  7.67it/s]
+P(y|x) 95:67200 loss=   0.045060337, acc=   0.984375000
+517it [01:07,  7.67it/s]
+P(y|x) 95:67300 loss=   0.024381995, acc=   0.984375000
+617it [01:20,  7.63it/s]
+P(y|x) 95:67400 loss=   0.107016556, acc=   0.968750000
+703it [01:32,  7.63it/s]
+Epoch 95: Train Loss 0.038525376468896866, Train Acc 0.9868865609169006
+Epoch 95: Test Loss 0.4487214982509613, Test Acc 0.9132999777793884
+Epoch 95: Valid Loss 0.4635002315044403, Valid Acc 0.9139999747276306
+14it [00:02,  7.58it/s]
+P(y|x) 96:67500 loss=   0.010367155, acc=   1.000000000
+114it [00:15,  7.62it/s]
+P(y|x) 96:67600 loss=   0.108819596, acc=   0.953125000
+214it [00:28,  7.64it/s]
+P(y|x) 96:67700 loss=   0.008117728, acc=   1.000000000
+314it [00:41,  7.71it/s]
+P(y|x) 96:67800 loss=   0.080200195, acc=   0.984375000
+414it [00:54,  7.71it/s]
+P(y|x) 96:67900 loss=   0.006165616, acc=   1.000000000
+514it [01:07,  7.70it/s]
+P(y|x) 96:68000 loss=   0.179719150, acc=   0.921875000
+614it [01:20,  7.69it/s]
+P(y|x) 96:68100 loss=   0.014987126, acc=   1.000000000
+703it [01:31,  7.65it/s]
+Epoch 96: Train Loss 0.061568040400743484, Train Acc 0.9804632067680359
+Epoch 96: Test Loss 0.4992802143096924, Test Acc 0.9092000126838684
+Epoch 96: Valid Loss 0.5017586946487427, Valid Acc 0.90420001745224
+11it [00:01,  7.47it/s]
+P(y|x) 97:68200 loss=   0.005358644, acc=   1.000000000
+111it [00:14,  7.68it/s]
+P(y|x) 97:68300 loss=   0.167013705, acc=   0.937500000
+211it [00:27,  7.60it/s]
+P(y|x) 97:68400 loss=   0.026750371, acc=   0.984375000
+311it [00:40,  7.65it/s]
+P(y|x) 97:68500 loss=   0.076175541, acc=   0.968750000
+411it [00:53,  7.62it/s]
+P(y|x) 97:68600 loss=   0.028317362, acc=   1.000000000
+511it [01:06,  7.61it/s]
+P(y|x) 97:68700 loss=   0.059549246, acc=   0.968750000
+611it [01:20,  7.68it/s]
+P(y|x) 97:68800 loss=   0.041252591, acc=   0.984375000
+703it [01:32,  7.63it/s]
+Epoch 97: Train Loss 0.045069217681884766, Train Acc 0.9849973320960999
+Epoch 97: Test Loss 0.46759116649627686, Test Acc 0.9128999710083008
+Epoch 97: Valid Loss 0.482066810131073, Valid Acc 0.9070000052452087
+8it [00:01,  7.29it/s]
+P(y|x) 98:68900 loss=   0.016567700, acc=   0.984375000
+108it [00:14,  7.62it/s]
+P(y|x) 98:69000 loss=   0.053932540, acc=   0.984375000
+208it [00:27,  7.59it/s]
+P(y|x) 98:69100 loss=   0.026904181, acc=   0.984375000
+308it [00:40,  7.61it/s]
+P(y|x) 98:69200 loss=   0.014933795, acc=   1.000000000
+408it [00:53,  7.67it/s]
+P(y|x) 98:69300 loss=   0.080867812, acc=   0.968750000
+508it [01:06,  7.68it/s]
+P(y|x) 98:69400 loss=   0.038494647, acc=   0.984375000
+608it [01:19,  7.63it/s]
+P(y|x) 98:69500 loss=   0.001541898, acc=   1.000000000
+703it [01:32,  7.62it/s]
+Epoch 98: Train Loss 0.04662720859050751, Train Acc 0.984197199344635
+Epoch 98: Test Loss 0.43064454197883606, Test Acc 0.9125000238418579
+Epoch 98: Valid Loss 0.4415260851383209, Valid Acc 0.9035999774932861
+5it [00:00,  6.64it/s]
+P(y|x) 99:69600 loss=   0.080400854, acc=   0.968750000
+105it [00:14,  7.70it/s]
+P(y|x) 99:69700 loss=   0.086150773, acc=   0.953125000
+205it [00:27,  7.63it/s]
+P(y|x) 99:69800 loss=   0.041643374, acc=   0.984375000
+305it [00:40,  7.67it/s]
+P(y|x) 99:69900 loss=   0.011078484, acc=   1.000000000
+405it [00:53,  7.73it/s]
+P(y|x) 99:70000 loss=   0.002928913, acc=   1.000000000
+505it [01:06,  7.65it/s]
+P(y|x) 99:70100 loss=   0.009026870, acc=   1.000000000
+605it [01:19,  7.67it/s]
+P(y|x) 99:70200 loss=   0.007393509, acc=   1.000000000
+703it [01:32,  7.63it/s]
+Epoch 99: Train Loss 0.0347626656293869, Train Acc 0.9881312251091003
+Epoch 99: Test Loss 0.41328808665275574, Test Acc 0.9154999852180481
+Epoch 99: Valid Loss 0.42923223972320557, Valid Acc 0.9147999882698059
+2it [00:00,  4.30it/s]
+P(y|x) 100:70300 loss=   0.090036996, acc=   0.968750000
+102it [00:13,  7.64it/s]
+P(y|x) 100:70400 loss=   0.025259592, acc=   0.984375000
+202it [00:26,  7.65it/s]
+P(y|x) 100:70500 loss=   0.020492509, acc=   1.000000000
+302it [00:39,  7.67it/s]
+P(y|x) 100:70600 loss=   0.078890800, acc=   0.968750000
+402it [00:52,  7.67it/s]
+P(y|x) 100:70700 loss=   0.247520357, acc=   0.953125000
+502it [01:05,  7.67it/s]
+P(y|x) 100:70800 loss=   0.095908128, acc=   0.968750000
+602it [01:18,  7.67it/s]
+P(y|x) 100:70900 loss=   0.133112103, acc=   0.953125000
+702it [01:31,  7.68it/s]
+P(y|x) 100:71000 loss=   0.021041434, acc=   0.984375000
+703it [01:31,  7.64it/s]
+Epoch 100: Train Loss 0.04102984070777893, Train Acc 0.9855085611343384
+Epoch 100: Test Loss 0.40556997060775757, Test Acc 0.9142000079154968
+Epoch 100: Valid Loss 0.46569740772247314, Valid Acc 0.9064000248908997
+99it [00:13,  7.62it/s]
+P(y|x) 101:71100 loss=   0.078383580, acc=   0.968750000
+199it [00:26,  7.66it/s]
+P(y|x) 101:71200 loss=   0.006814860, acc=   1.000000000
+299it [00:39,  7.62it/s]
+P(y|x) 101:71300 loss=   0.023553297, acc=   1.000000000
+399it [00:52,  7.68it/s]
+P(y|x) 101:71400 loss=   0.037594713, acc=   0.984375000
+499it [01:05,  7.68it/s]
+P(y|x) 101:71500 loss=   0.060172707, acc=   0.968750000
+599it [01:18,  7.68it/s]
+P(y|x) 101:71600 loss=   0.064889319, acc=   0.953125000
+699it [01:31,  7.63it/s]
+P(y|x) 101:71700 loss=   0.028238125, acc=   0.984375000
+703it [01:32,  7.64it/s]
+Epoch 101: Train Loss 0.04911365732550621, Train Acc 0.9842194318771362
+Epoch 101: Test Loss 0.48369100689888, Test Acc 0.9126999974250793
+Epoch 101: Valid Loss 0.4790480434894562, Valid Acc 0.9147999882698059
+96it [00:12,  7.61it/s]
+P(y|x) 102:71800 loss=   0.045963868, acc=   0.984375000
+196it [00:25,  7.70it/s]
+P(y|x) 102:71900 loss=   0.115208305, acc=   0.984375000
+296it [00:39,  7.58it/s]
+P(y|x) 102:72000 loss=   0.055525824, acc=   0.984375000
+396it [00:52,  7.65it/s]
+P(y|x) 102:72100 loss=   0.038680688, acc=   0.984375000
+496it [01:05,  7.63it/s]
+P(y|x) 102:72200 loss=   0.012401089, acc=   0.984375000
+596it [01:18,  7.62it/s]
+P(y|x) 102:72300 loss=   0.028161690, acc=   0.984375000
+696it [01:31,  7.55it/s]
+P(y|x) 102:72400 loss=   0.012419373, acc=   1.000000000
+703it [01:32,  7.61it/s]
+Epoch 102: Train Loss 0.04440099373459816, Train Acc 0.985286295413971
+Epoch 102: Test Loss 0.43136534094810486, Test Acc 0.9088000059127808
+Epoch 102: Valid Loss 0.47474247217178345, Valid Acc 0.9010000228881836
+93it [00:12,  7.67it/s]
+P(y|x) 103:72500 loss=   0.066840231, acc=   0.984375000
+193it [00:25,  7.64it/s]
+P(y|x) 103:72600 loss=   0.054525875, acc=   0.984375000
+293it [00:38,  7.68it/s]
+P(y|x) 103:72700 loss=   0.038394101, acc=   0.984375000
+393it [00:51,  7.65it/s]
+P(y|x) 103:72800 loss=   0.119187184, acc=   0.968750000
+493it [01:04,  7.60it/s]
+P(y|x) 103:72900 loss=   0.012722623, acc=   1.000000000
+593it [01:17,  7.64it/s]
+P(y|x) 103:73000 loss=   0.036327362, acc=   0.968750000
+693it [01:31,  7.61it/s]
+P(y|x) 103:73100 loss=   0.040788375, acc=   0.968750000
+703it [01:32,  7.61it/s]
+Epoch 103: Train Loss 0.04458380863070488, Train Acc 0.9857752323150635
+Epoch 103: Test Loss 0.47606727480888367, Test Acc 0.9103999733924866
+Epoch 103: Valid Loss 0.49872055649757385, Valid Acc 0.9107999801635742
+90it [00:12,  7.62it/s]
+P(y|x) 104:73200 loss=   0.001111902, acc=   1.000000000
+190it [00:25,  7.61it/s]
+P(y|x) 104:73300 loss=   0.058168530, acc=   0.953125000
+290it [00:38,  7.63it/s]
+P(y|x) 104:73400 loss=   0.002730817, acc=   1.000000000
+390it [00:51,  7.64it/s]
+P(y|x) 104:73500 loss=   0.000942931, acc=   1.000000000
+490it [01:04,  7.60it/s]
+P(y|x) 104:73600 loss=   0.126963511, acc=   0.968750000
+590it [01:17,  7.64it/s]
+P(y|x) 104:73700 loss=   0.037109070, acc=   0.984375000
+690it [01:30,  7.64it/s]
+P(y|x) 104:73800 loss=   0.046487592, acc=   0.984375000
+703it [01:32,  7.60it/s]
+Epoch 104: Train Loss 0.05233277752995491, Train Acc 0.9823746681213379
+Epoch 104: Test Loss 0.39116060733795166, Test Acc 0.910099983215332
+Epoch 104: Valid Loss 0.4085228145122528, Valid Acc 0.9118000268936157
+87it [00:11,  7.56it/s]
+P(y|x) 105:73900 loss=   0.003473178, acc=   1.000000000
+187it [00:24,  7.58it/s]
+P(y|x) 105:74000 loss=   0.030338302, acc=   1.000000000
+287it [00:37,  7.58it/s]
+P(y|x) 105:74100 loss=   0.072709620, acc=   0.968750000
+387it [00:51,  7.64it/s]
+P(y|x) 105:74200 loss=   0.026284359, acc=   1.000000000
+487it [01:04,  7.61it/s]
+P(y|x) 105:74300 loss=   0.039682262, acc=   0.984375000
+587it [01:17,  7.70it/s]
+P(y|x) 105:74400 loss=   0.004723251, acc=   1.000000000
+687it [01:30,  7.63it/s]
+P(y|x) 105:74500 loss=   0.078819141, acc=   0.968750000
+703it [01:32,  7.60it/s]
+Epoch 105: Train Loss 0.07675722241401672, Train Acc 0.9770625829696655
+Epoch 105: Test Loss 0.5317450165748596, Test Acc 0.8974999785423279
+Epoch 105: Valid Loss 0.5226938724517822, Valid Acc 0.9043999910354614
+84it [00:11,  7.62it/s]
+P(y|x) 106:74600 loss=   0.080103658, acc=   0.968750000
+184it [00:24,  7.70it/s]
+P(y|x) 106:74700 loss=   0.031990923, acc=   0.984375000
+284it [00:37,  7.56it/s]
+P(y|x) 106:74800 loss=   0.019199714, acc=   0.984375000
+384it [00:50,  7.62it/s]
+P(y|x) 106:74900 loss=   0.001913339, acc=   1.000000000
+484it [01:03,  7.68it/s]
+P(y|x) 106:75000 loss=   0.027169146, acc=   0.984375000
+584it [01:16,  7.65it/s]
+P(y|x) 106:75100 loss=   0.069991015, acc=   0.953125000
+684it [01:29,  7.63it/s]
+P(y|x) 106:75200 loss=   0.032894805, acc=   0.984375000
+703it [01:32,  7.62it/s]
+Epoch 106: Train Loss 0.06361962109804153, Train Acc 0.9792407751083374
+Epoch 106: Test Loss 0.48064184188842773, Test Acc 0.9035999774932861
+Epoch 106: Valid Loss 0.47400057315826416, Valid Acc 0.9010000228881836
+81it [00:10,  7.68it/s]
+P(y|x) 107:75300 loss=   0.008885190, acc=   1.000000000
+181it [00:23,  7.71it/s]
+P(y|x) 107:75400 loss=   0.001119047, acc=   1.000000000
+281it [00:36,  7.66it/s]
+P(y|x) 107:75500 loss=   0.017764822, acc=   1.000000000
+381it [00:49,  7.66it/s]
+P(y|x) 107:75600 loss=   0.125397533, acc=   0.953125000
+481it [01:02,  7.63it/s]
+P(y|x) 107:75700 loss=   0.028851248, acc=   0.984375000
+524it [01:08,  7.68it/s]
+In [ ]:
+
+​
+
