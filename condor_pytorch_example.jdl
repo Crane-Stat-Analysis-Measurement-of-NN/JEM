@@ -3,7 +3,7 @@
 universe   = vanilla
 executable = train_call.sh
 
-transfer_input_files = train_nosgld_noaug.py
+transfer_input_files = sub_train.py
 
 should_transfer_files = Yes
 when_to_transfer_output = ON_EXIT_OR_EVICT

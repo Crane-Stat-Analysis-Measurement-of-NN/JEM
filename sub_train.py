@@ -19,7 +19,6 @@ import re
 from tqdm import tqdm
 t.backends.cudnn.benchmark = True
 t.backends.cudnn.enabled = True
-seed = args.seed
 
 
 
@@ -703,7 +702,7 @@ class train_args():
         # set defaults
         self.dataset = "cifar10" #, choices=["cifar10", "svhn", "cifar100"])
         self.n_classes = 100 if self.dataset == "cifar100" else 10
-        self.data_root = "../data" 
+        self.data_root = "/scratch365/jpiland/data" 
         # optimization
         self.lr = 1e-4
         self.decay_epochs = [160, 180] # help="decay learning rate by decay_rate at these epochs")
@@ -745,7 +744,7 @@ class train_args():
         self.plot_uncond = False #", action="store_true", help="If set, save unconditional samples")
         self.n_valid = 5000
         self.purpose = ""
-        self.seed=1
+        self.seed = 1
 
         # set from inline dict
         for key in param_dict:
@@ -754,7 +753,7 @@ class train_args():
 
 
 
-t_seed=sys.argv[1]
+t_seed=int(sys.argv[1])
 sdir=sys.argv[2]
 
 # setup change from defaults
@@ -763,8 +762,8 @@ inline_parms = {"lr": .0001, "dataset": "cifar10", "optimizer": "adam",
                 "p_x_weight": 1.0, "p_y_given_x_weight": 1.0, "p_x_y_weight": 0.0, \
                 "sigma": .03, "width": 10, "depth": 28, "plot_uncond": False, \
                 "uncond": False, "decay_epochs": [], \
-                "ckpt_every": 1, \
-                "n_epochs": 2, \
+                "ckpt_every": 10, \
+                "n_epochs": 150, \
                 "seed": t_seed }
 
 # instantiate
@@ -772,5 +771,6 @@ args = train_args(inline_parms)
 
 print("arg warmup_iters", args.warmup_iters, "lr", args.lr)
 
+seed = args.seed
 # run
 main(args)
