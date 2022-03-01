@@ -54,6 +54,8 @@ parser.add_argument('--no_random_start',  action='store_true')
 parser.add_argument("--load_path", type=str, default=None)
 parser.add_argument("--distance", type=str, default='Linf')
 parser.add_argument("--n_steps_pgd_attack", type=int, default=40)
+parser.add_argument("--epsilon",type=float, default=None)
+parser.add_argument("--max_dist",type=float, default=None)
 parser.add_argument("--start_batch", type=int, default=-1)
 parser.add_argument("--end_batch", type=int, default=2)
 parser.add_argument("--sgld_sigma", type=float, default=1e-2)
@@ -252,18 +254,20 @@ for i, (img, label) in enumerate(data_loader):
         im = img[k,:,:,:]
         orig_label = label[k].data.cpu().numpy()
         if pred[k] != orig_label:
+            adversaries.append("Failed Prediction")
             continue
         best_adv = None
         for ii in range(args.attack_tries):
             try:
-                adversarial = attack(im, label=orig_label, unpack=False, random_start=True, iterations=args.n_steps_pgd_attack) 
+                adversarial = attack(im, label=orig_label, unpack=False, random_start=True, iterations=args.n_steps_pgd_attack)
                 if ii == 0 or best_adv.distance < adversarial.distance:
                     best_adv = adversarial
             except:
                 continue
         try:
             adversaries.append((im, orig_label, best_adv.image, best_adv.adversarial_class, best_adv.distance))
-        except: 
+        except:
+            print("No adv found at all")
             continue
     adv_save_dir = os.path.join(base_dir, args.exp_name)
     save_file = 'adversarials_batch_'+str(i)
