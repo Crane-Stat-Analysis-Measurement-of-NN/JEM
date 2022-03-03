@@ -12,6 +12,7 @@ import wideresnet # from The Google Research Authors
 import json
 import re
 import time
+import pdb
 
 
 
@@ -79,8 +80,10 @@ class CCF(F):
     def forward(self, x, y=None):
         logits = self.classify(x)
         if y is None:
+            print('correct!!')
             return logits.logsumexp(1)
         else:
+            print('sad day')
             # gathers the logits along dim 1 with indeces y
             return t.gather(logits, 1, y[:, None])
 
@@ -369,6 +372,18 @@ def checkpoint(f, opt, buffer, epoch_no, tag, args, device):
 
 
 
+#clear old epochs
+def del_old_epoch(args,epoch):
+    if args.save_mod>0:
+        if epoch%args.save_mod==0:
+            return
+    if os.path.exists(os.path.join(args.save_dir+f'ckpt_{epoch-args.delback}.pt')):
+        os.remove(os.path.join(args.save_dir+f'ckpt_{epoch-args.delback}.pt'))
+        print(f'ckpt_{epoch-args.delback}.pt checkpoint deleted.')
+
+
+
+
 
 #Track loss for convergence
 def loss_tracker(filename,save_dir,epoch,loss,correct):
@@ -427,12 +442,17 @@ def set_up_experiment(args,seed):
     if args.print_to_log:
         sys.stdout = open(f'{args.save_dir}/log.txt', 'w')
 
+    if args.clear_save:
+        for fl in ['track_test.csv','track_train.csv','track_valid.csv',
+                   'epoch_times.csv','best_valid_ckpt.pt']:
+            os.remove(os.path.join(args.save_dir,fl))
+
     t.manual_seed(seed)
     if t.cuda.is_available():
         t.cuda.manual_seed_all(seed)
         
     # store purpose of experiment
-    exp_purpose("Get SGLD to train using the CCF model and simplest parameters.")
+    exp_purpose(args.note)
 
 
 
@@ -601,6 +621,10 @@ def main(args):
         scores = grad_norm(x_p_d).detach().cpu()
         real_scores = np.append(real_scores,scores.numpy())
 
+        with open('./debug/eds.txt','a') as edf:
+            dblist = [str(i) for i in real_scores]
+            out = f'{epoch},{",".join(dblist)}\n'
+            edf.write(out)
         return real_scores  
     
     
@@ -699,7 +723,8 @@ def main(args):
                     l_p_x_y = not_paper(sample_q,f,replay_buffer,y_lab,x_lab)
                     # add to loss
                     L += args.p_x_y_weight * l_p_x_y
-
+                
+                #Energy derivative mean
                 if args.ed_mean_weight > 0:
                     derivatives = energy_derivatives(f,args,x_p_d)
                     L += args.ed_mean_weight * (sum(derivatives)/dtrain_size)
@@ -743,10 +768,11 @@ def main(args):
                 timef.write(f'{epoch},{time.time()}\n')
                 epoch+=1
 
-            if os.path.exists(os.path.join(args.save_dir+f'ckpt_{epoch-2}.pt')):
-                    if (epoch-2)%10 != 0:
-                        os.remove(os.path.join(args.save_dir+f'ckpt_{epoch-2}.pt'))
-                        print(os.path.join(args.save_dir+f'ckpt_{epoch-2}.pt')," checkpoint deleted.")
+
+            #Clears old checkpoint
+            if args.delback>0:
+                pdb.set_trace()
+                del_old_ckpt(args,epoch)
         ####### END WHILE LOOP
 
 
@@ -807,7 +833,10 @@ parser.add_argument("--n_valid", type=int, default=5000)
 parser.add_argument("--new_energy",type=float, default=1.0)
 parser.add_argument("--ed_mean_weight",type=float, default=0.0)
 parser.add_argument("--seed",type=int, default=1111)
-
+parser.add_argument("--delback",type=int, default=0, help="If delback>0, it will delete any checkpoint more than delback epochs old while running")
+parser.add_argument("--save_mod",type=int, default=0, help="If save_mod>0, it will override delback on multiples of save_mod")
+parser.add_argument("--clear_save",action="store_true", help="If set, deletes the tracking files from the save directory (e.g., epoch_times.csv, track_train.csv) AND best_valid_ckpt.pt")
+parser.add_argument("--note",type=str, default="Why *am* I doing this?", help="Save a note on the purpose of this experiment."
 args = parser.parse_args()
 args.n_classes = 100 if args.dataset == "cifar100" else 10
 
