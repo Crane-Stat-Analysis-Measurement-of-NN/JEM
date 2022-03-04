@@ -80,10 +80,8 @@ class CCF(F):
     def forward(self, x, y=None):
         logits = self.classify(x)
         if y is None:
-            print('correct!!')
             return logits.logsumexp(1)
         else:
-            print('sad day')
             # gathers the logits along dim 1 with indeces y
             return t.gather(logits, 1, y[:, None])
 
@@ -436,7 +434,7 @@ def get_optimizer(args,f):
 
 def set_up_experiment(args,seed):
     print(args.__dict__)
-    utils.makedirs(args.save_dir)
+    utils.makedirs(args.save_dir);
     with open(f'{args.save_dir}/params.txt', 'w') as f:
         json.dump(args.__dict__, f)
     if args.print_to_log:
@@ -444,8 +442,11 @@ def set_up_experiment(args,seed):
 
     if args.clear_save:
         for fl in ['track_test.csv','track_train.csv','track_valid.csv',
-                   'epoch_times.csv','best_valid_ckpt.pt']:
-            os.remove(os.path.join(args.save_dir,fl))
+                   'epoch_times.csv','best_valid_ckpt.pt','eds.txt']:
+            try:
+                os.remove(os.path.join(args.save_dir,fl))
+            except:
+                print(f'{fl} did not exist.')
 
     t.manual_seed(seed)
     if t.cuda.is_available():
@@ -579,6 +580,28 @@ def main(args):
 
         return l_p_x    
     
+
+    #Calculates the average of the energy dirivatives of the input data
+    def energy_derivatives(f,args,x_p_d):
+        def grad_norm(x):
+            x_k = t.autograd.Variable(x, requires_grad=True);
+            f_prime = t.autograd.grad(f(x_k).sum(), [x_k], create_graph=True, retain_graph=True)[0]
+            grad = f_prime.view(x.size(0), -1)
+            return grad.norm(p=2, dim=1)
+
+
+        real_scores=[]
+        scores = grad_norm(x_p_d).detach().cpu()
+        real_scores = np.append(real_scores,scores.numpy())
+
+        with open(os.path.join(args.save_dir,'eds.txt'),'a') as edf:
+            dblist = [str(i) for i in real_scores]
+            out = f'{epoch},{",".join(dblist)}\n'
+            edf.write(out)
+        return real_scores  
+
+
+
     #Two functions for the adaptive learning
     def retry_epoch():
         bad_epoch=epoch
@@ -608,24 +631,6 @@ def main(args):
                 x_q_y = sample_q(f, replay_buffer, y=y)
                 plot('{}/x_q_y{}_{:>06d}.png'.format(args.save_dir, epoch, i), x_q_y)
     
-    #Calculates the average of the energy dirivatives of the input data
-    def energy_derivatives(f,args,x_p_d):
-        def grad_norm(x):
-            x_k = t.autograd.Variable(x, requires_grad=True)
-            f_prime = t.autograd.grad(f(x_k).sum(), [x_k], retain_graph=True)[0]
-            grad = f_prime.view(x.size(0), -1)
-            return grad.norm(p=2, dim=1)
-
-
-        real_scores=[]
-        scores = grad_norm(x_p_d).detach().cpu()
-        real_scores = np.append(real_scores,scores.numpy())
-
-        with open('./debug/eds.txt','a') as edf:
-            dblist = [str(i) for i in real_scores]
-            out = f'{epoch},{",".join(dblist)}\n'
-            edf.write(out)
-        return real_scores  
     
     
     ######################################################
@@ -699,7 +704,7 @@ def main(args):
 
                 # No SGLD energy
                 if args.new_energy > 0:
-                    logits = f.classify(x_lab)
+                    logits = f.classify(x_lab);
 
                     ####################################################
                     # Maximize entropy by assuming equal probabilities #
@@ -771,7 +776,6 @@ def main(args):
 
             #Clears old checkpoint
             if args.delback>0:
-                pdb.set_trace()
                 del_old_ckpt(args,epoch)
         ####### END WHILE LOOP
 
@@ -836,7 +840,7 @@ parser.add_argument("--seed",type=int, default=1111)
 parser.add_argument("--delback",type=int, default=0, help="If delback>0, it will delete any checkpoint more than delback epochs old while running")
 parser.add_argument("--save_mod",type=int, default=0, help="If save_mod>0, it will override delback on multiples of save_mod")
 parser.add_argument("--clear_save",action="store_true", help="If set, deletes the tracking files from the save directory (e.g., epoch_times.csv, track_train.csv) AND best_valid_ckpt.pt")
-parser.add_argument("--note",type=str, default="Why *am* I doing this?", help="Save a note on the purpose of this experiment."
+parser.add_argument("--note",type=str, default="Why *am* I doing this?", help="Save a note on the purpose of this experiment.")
 args = parser.parse_args()
 args.n_classes = 100 if args.dataset == "cifar100" else 10
 
