@@ -190,8 +190,10 @@ def get_data(args):
     np.random.shuffle(all_inds)
     # seperate out validation set
     if args.n_valid is not None:
+        print('Goood!')
         valid_inds, train_inds = all_inds[:args.n_valid], all_inds[args.n_valid:]
     else:
+        print('baaad!')
         valid_inds, train_inds = [], all_inds
     train_inds = np.array(train_inds)
     dtrain_size = len(train_inds)
@@ -206,6 +208,9 @@ def get_data(args):
     else:
         train_labeled_inds = train_inds
     
+    with open(os.path.join(args.save_dir,'train_indices.txt'),'w') as tif:
+        out = ' '.join([str(i) for i in train_inds])
+        tif.write(out)
     dset_train = DataSubset(
         dataset_fn(True, transform_train),
         inds=train_inds)
@@ -371,12 +376,12 @@ def checkpoint(f, opt, buffer, epoch_no, tag, args, device):
 
 
 #clear old epochs
-def del_old_epoch(args,epoch):
+def del_old_ckpt(args,epoch):
     if args.save_mod>0:
-        if epoch%args.save_mod==0:
+        if (epoch-args.delback)%args.save_mod==0:
             return
-    if os.path.exists(os.path.join(args.save_dir+f'ckpt_{epoch-args.delback}.pt')):
-        os.remove(os.path.join(args.save_dir+f'ckpt_{epoch-args.delback}.pt'))
+    if os.path.exists(os.path.join(args.save_dir,f'ckpt_{epoch-args.delback}.pt')):
+        os.remove(os.path.join(args.save_dir,f'ckpt_{epoch-args.delback}.pt'))
         print(f'ckpt_{epoch-args.delback}.pt checkpoint deleted.')
 
 
@@ -532,10 +537,10 @@ def main(args):
         with t.no_grad():
             for ev,dl in zip(iterify(evs),iterify(dls)):
                 print('ev: ',ev)
-                correct, loss = eval_func(f, dload_test, device)    
+                correct, loss = eval_func(f, dl, device)    
                 if with_tracker:
                     loss_tracker(f'track_{ev}.csv',args.save_dir,epoch,loss,correct)
-        print(f"{ev}: Epoch {epoch}: Valid Loss {loss}, Valid Acc {correct}")
+                print(f"{ev}: Epoch {epoch}: Loss {loss}, Acc {correct}")
         f.train()
         return correct
     
@@ -544,7 +549,7 @@ def main(args):
         dls=[dload_test,dload_train,dload_valid]
         return basic_eval(eval_func,dls,evs,with_tracker)
     
-    def update_best():
+    def update_best(correct):
         print("Best Valid!: {}".format(correct))
         checkpoint(f, optim, replay_buffer, epoch, f'best_valid_ckpt.pt', args, device)
     
@@ -584,7 +589,7 @@ def main(args):
     #Calculates the average of the energy dirivatives of the input data
     def energy_derivatives(f,args,x_p_d):
         def grad_norm(x):
-            x_k = t.autograd.Variable(x, requires_grad=True);
+            x_k = t.autograd.Variable(x, requires_grad=True)
             f_prime = t.autograd.grad(f(x_k).sum(), [x_k], create_graph=True, retain_graph=True)[0]
             grad = f_prime.view(x.size(0), -1)
             return grad.norm(p=2, dim=1)
@@ -659,7 +664,7 @@ def main(args):
     optim=get_optimizer(args,f)
 
     # Quick eval of imported model
-    basic_eval(eval_classification,dload_valid,'valid')
+    basic_eval(eval_classification,[dload_valid],'valid')
     
     #Set variables for the while loop
     bad_epoch=-1
@@ -704,7 +709,7 @@ def main(args):
 
                 # No SGLD energy
                 if args.new_energy > 0:
-                    logits = f.classify(x_lab);
+                    logits = f.classify(x_lab)
 
                     ####################################################
                     # Maximize entropy by assuming equal probabilities #
@@ -730,8 +735,8 @@ def main(args):
                     L += args.p_x_y_weight * l_p_x_y
                 
                 #Energy derivative mean
+                derivatives = energy_derivatives(f,args,x_p_d)
                 if args.ed_mean_weight > 0:
-                    derivatives = energy_derivatives(f,args,x_p_d)
                     L += args.ed_mean_weight * (sum(derivatives)/dtrain_size)
                     
                 # Handle Loss divergence
@@ -764,10 +769,11 @@ def main(args):
 
                 # Performance assesment 
                 if epoch % args.eval_every == 0 and (args.p_y_given_x_weight > 0 or args.p_x_y_weight > 0):
-                    correct = eval_all_3(eval_classification,with_tracker=True)
-                    if correct > best_valid_acc: 
-                        best_valid_acc = correct
-                        update_best()
+                    basic_eval(eval_classification,[dload_train,dload_test],['train','test'],with_tracker=True)
+                    curr_valid = basic_eval(eval_classification,[dload_valid],'valid',with_tracker=True)
+                    if curr_valid > best_valid_acc: 
+                        best_valid_acc = curr_valid
+                        update_best(curr_valid)
 
                 print(f'{epoch},{time.time()}\n')
                 timef.write(f'{epoch},{time.time()}\n')
