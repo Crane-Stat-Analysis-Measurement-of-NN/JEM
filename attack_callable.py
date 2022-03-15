@@ -251,6 +251,7 @@ for i, (img, label) in enumerate(data_loader):
     top = top.data.cpu().numpy()
     pred = top[:,0]
     for k in range(len(label)):
+        print(f'doing image {k}')
         im = img[k,:,:,:]
         orig_label = label[k].data.cpu().numpy()
         if pred[k] != orig_label:

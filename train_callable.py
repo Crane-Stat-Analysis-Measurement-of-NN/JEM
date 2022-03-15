@@ -190,10 +190,8 @@ def get_data(args):
     np.random.shuffle(all_inds)
     # seperate out validation set
     if args.n_valid is not None:
-        print('Goood!')
         valid_inds, train_inds = all_inds[:args.n_valid], all_inds[args.n_valid:]
     else:
-        print('baaad!')
         valid_inds, train_inds = [], all_inds
     train_inds = np.array(train_inds)
     dtrain_size = len(train_inds)
@@ -735,9 +733,17 @@ def main(args):
                     L += args.p_x_y_weight * l_p_x_y
                 
                 #Energy derivative mean
-                derivatives = energy_derivatives(f,args,x_p_d)
-                if args.ed_mean_weight > 0:
-                    L += args.ed_mean_weight * (sum(derivatives)/dtrain_size)
+                if args.ed_mean_weight>0.0:
+                    x_lab = t.autograd.Variable(x_lab, requires_grad=True)
+                    f_prime = t.autograd.grad(f(x_lab).sum(), x_lab, create_graph=True)[0]
+                    grad = f_prime.view(x_lab.size(0), -1)
+                    gnorm = grad.norm(p=2, dim=1)
+                    ed_loss = t.mean(gnorm)
+                    L += args.ed_mean_weight * ed_loss
+                    with open(os.path.join(args.save_dir,'eds.txt'),'a') as edf:
+                        dblist = [str(i) for i in gnorm]
+                        out = f'{epoch},{",".join(dblist)}\n'
+                        edf.write(out)
                     
                 # Handle Loss divergence
                 if L.abs().item() > 1e8:
