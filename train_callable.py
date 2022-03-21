@@ -224,6 +224,11 @@ def get_data(args):
     dset_test = dataset_fn(False, transform_test)
     dload_valid = DataLoader(dset_valid, batch_size=100, shuffle=False, num_workers=4, drop_last=False)
     dload_test = DataLoader(dset_test, batch_size=100, shuffle=False, num_workers=4, drop_last=False)
+    #dload_test = DataLoader(
+    #        tv.datasets.SVHN(root=args.data_root, 
+    #            transform=tr.Compose([tr.ToTensor()]),
+    #            download=True,split="test"),
+    #        batch_size=100, num_workers=4, drop_last=False)
     return dload_train, dload_train_labeled, dload_valid, dload_test, dtrain_size
 
 
